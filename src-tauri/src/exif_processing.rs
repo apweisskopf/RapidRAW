@@ -1690,10 +1690,10 @@ impl ExportXmp {
         let tags = metadata.tags.as_deref().unwrap_or_default();
         let mut keywords = Vec::new();
         for tag in tags.iter().filter(|t| !t.starts_with(COLOR_TAG_PREFIX)) {
-            push_keyword(
-                &mut keywords,
-                tag.strip_prefix(USER_TAG_PREFIX).unwrap_or(tag),
-            );
+            for node in xmp_sidecar::keyword_nodes(tag.strip_prefix(USER_TAG_PREFIX).unwrap_or(tag))
+            {
+                push_keyword(&mut keywords, node);
+            }
         }
         Self {
             keywords,

@@ -26,6 +26,8 @@ const NS_DARKTABLE: &[u8] = b"http://darktable.sf.net/";
 const NS_DIGIKAM: &[u8] = b"http://www.digikam.org/ns/1.0/";
 const NS_LR: &[u8] = b"http://ns.adobe.com/lightroom/1.0/";
 
+pub const HIERARCHY_SEPARATOR: char = '|';
+
 pub(crate) fn is_darktable_internal(tag: &str) -> bool {
     tag.starts_with("darktable|")
 }
@@ -35,6 +37,7 @@ pub struct XmpFields {
     pub rating: Option<i8>,
     pub label: Option<String>,
     pub subject: Vec<String>,
+    pub hierarchical_subject: Vec<String>,
     pub rating_invalid: bool,
     pub darktable_colorlabels: Option<Vec<String>>,
     pub digikam_color_label: Option<String>,
@@ -49,6 +52,7 @@ enum Ctx {
     Rating,
     Label,
     Subject,
+    Hierarchical,
     DtLabels,
     DkLabel,
     Container,
@@ -156,6 +160,8 @@ impl Collector {
                     Ctx::Label
                 } else if is_name(ns, NS_DC, local, &[b"subject"]) {
                     Ctx::Subject
+                } else if is_name(ns, NS_LR, local, &[b"hierarchicalSubject"]) {
+                    Ctx::Hierarchical
                 } else if is_name(ns, NS_DARKTABLE, local, &[b"colorlabels"]) {
                     Ctx::DtLabels
                 } else if is_name(ns, NS_DIGIKAM, local, &[b"ColorLabel"]) {
@@ -164,7 +170,7 @@ impl Collector {
                     Ctx::Ignored
                 }
             }
-            Some(Ctx::Subject | Ctx::DtLabels) => {
+            Some(Ctx::Subject | Ctx::Hierarchical | Ctx::DtLabels) => {
                 if is_name(ns, NS_RDF, local, &[b"Bag", b"Seq", b"Alt"]) {
                     Ctx::Container
                 } else {
@@ -195,7 +201,9 @@ impl Collector {
                     self.fields.darktable_ns = true;
                 }
             }
-            Ctx::Rating | Ctx::Label | Ctx::Subject | Ctx::DkLabel => self.mark(ctx)?,
+            Ctx::Rating | Ctx::Label | Ctx::Subject | Ctx::Hierarchical | Ctx::DkLabel => {
+                self.mark(ctx)?
+            }
             Ctx::DtLabels => {
                 self.mark(ctx)?;
                 self.fields
@@ -227,6 +235,8 @@ impl Collector {
                         self.set_label(&value);
                     } else if is_name(&attr_ns, NS_DC, local_attr, &[b"subject"]) {
                         return Err("dc:subject as an attribute".to_string());
+                    } else if is_name(&attr_ns, NS_LR, local_attr, &[b"hierarchicalSubject"]) {
+                        return Err("lr:hierarchicalSubject as an attribute".to_string());
                     } else if is_name(&attr_ns, NS_DIGIKAM, local_attr, &[b"ColorLabel"]) {
                         self.mark(Ctx::DkLabel)?;
                         self.fields.digikam_color_label = Some(value.trim().to_string());
@@ -237,6 +247,7 @@ impl Collector {
                 Ctx::Rating
                 | Ctx::Label
                 | Ctx::Subject
+                | Ctx::Hierarchical
                 | Ctx::DtLabels
                 | Ctx::DkLabel
                 | Ctx::Container
@@ -277,6 +288,10 @@ impl Collector {
                             if let Some(labels) = self.fields.darktable_colorlabels.as_mut() {
                                 labels.push(value.to_string());
                             }
+                        } else if owner == Some(Ctx::Hierarchical) {
+                            if !self.fields.hierarchical_subject.iter().any(|t| t == value) {
+                                self.fields.hierarchical_subject.push(value.to_string());
+                            }
                         } else if !is_darktable_internal(value)
                             && !self.fields.subject.iter().any(|t| t == value)
                         {
@@ -298,7 +313,7 @@ impl Collector {
                 self.text.push_str(raw);
                 return Ok(());
             }
-            Some(Ctx::Subject | Ctx::DtLabels | Ctx::Container) => is_xml_space,
+            Some(Ctx::Subject | Ctx::Hierarchical | Ctx::DtLabels | Ctx::Container) => is_xml_space,
             None if self.root_closed => |c| is_xml_space(c) || c == '\0',
             None => |c| is_xml_space(c) || c == '\u{feff}',
             _ => return Ok(()),
@@ -651,6 +666,7 @@ const RAPIDRAW_COLORS: [&str; 5] = ["red", "yellow", "green", "blue", "purple"];
 
 const NS_XMP_STR: &str = "http://ns.adobe.com/xap/1.0/";
 const NS_DC_STR: &str = "http://purl.org/dc/elements/1.1/";
+const NS_LR_STR: &str = "http://ns.adobe.com/lightroom/1.0/";
 
 const NEW_XMP: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="RapidRAW">
@@ -750,19 +766,251 @@ pub(crate) fn xmp_keywords(tags: &[String]) -> Vec<String> {
         if tag.starts_with(COLOR_TAG_PREFIX) {
             continue;
         }
-        let keyword = tag.strip_prefix(USER_TAG_PREFIX).unwrap_or(tag).trim();
-        if keyword.is_empty() {
+        let Some(keyword) = normalize_keyword(tag.strip_prefix(USER_TAG_PREFIX).unwrap_or(tag))
+        else {
             continue;
-        }
-        if !valid_xml_text(keyword) {
+        };
+        if !valid_xml_text(&keyword) {
             log::warn!("Dropping XMP keyword with characters invalid in XML");
             continue;
         }
-        if seen.insert(keyword.to_string()) {
-            keywords.push(keyword.to_string());
+        if seen.insert(keyword.clone()) {
+            keywords.push(keyword);
         }
     }
     keywords
+}
+
+pub fn keyword_nodes(tag: &str) -> Vec<&str> {
+    tag.split(HIERARCHY_SEPARATOR)
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+pub fn normalize_keyword(tag: &str) -> Option<String> {
+    let nodes = keyword_nodes(tag);
+    (!nodes.is_empty()).then(|| nodes.join(&HIERARCHY_SEPARATOR.to_string()))
+}
+
+pub fn normalize_user_tag(tag: &str) -> Option<String> {
+    match tag.strip_prefix(USER_TAG_PREFIX) {
+        Some(name) => normalize_keyword(name).map(|name| format!("{}{}", USER_TAG_PREFIX, name)),
+        None => Some(tag.to_string()),
+    }
+}
+
+fn is_path(keyword: &str) -> bool {
+    keyword.contains(HIERARCHY_SEPARATOR)
+}
+
+fn join_nodes(nodes: &[&str]) -> String {
+    nodes.join(&HIERARCHY_SEPARATOR.to_string())
+}
+
+pub fn merge_keywords(subject: &[String], hierarchical: &[String]) -> Vec<String> {
+    let mut flat: Vec<String> = Vec::new();
+    for item in subject {
+        if is_darktable_internal(item.trim()) {
+            continue;
+        }
+        if let Some(keyword) = normalize_keyword(item)
+            && !flat.contains(&keyword)
+        {
+            flat.push(keyword);
+        }
+    }
+    if flat.is_empty() {
+        return Vec::new();
+    }
+    let known: HashSet<&str> = flat.iter().map(String::as_str).collect();
+
+    let mut kept: Vec<String> = Vec::new();
+    for entry in hierarchical {
+        if is_darktable_internal(entry.trim()) {
+            continue;
+        }
+        let nodes = keyword_nodes(entry);
+        let Some(len) = (1..=nodes.len())
+            .rev()
+            .find(|len| known.contains(nodes[len - 1]))
+        else {
+            continue;
+        };
+        let path = join_nodes(&nodes[..len]);
+        if !kept.contains(&path) {
+            kept.push(path);
+        }
+    }
+
+    let covered: HashSet<&str> = kept.iter().flat_map(|path| keyword_nodes(path)).collect();
+    let rest: Vec<String> = flat
+        .iter()
+        .filter(|item| !covered.contains(item.as_str()))
+        .cloned()
+        .collect();
+    kept.extend(rest);
+    kept
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OldKeywords {
+    pub subject: Vec<String>,
+    pub hierarchical: Option<Vec<String>>,
+    pub tags_list: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct KeywordProperties {
+    pub subject: Vec<String>,
+    pub hierarchical: Option<Vec<String>>,
+    pub tags_list: Option<Vec<String>>,
+}
+
+fn push_unique(list: &mut Vec<String>, value: &str) {
+    if !list.iter().any(|v| v == value) {
+        list.push(value.to_string());
+    }
+}
+
+pub fn keyword_properties(keywords: &[String], old: &OldKeywords) -> KeywordProperties {
+    let mut subject = Vec::new();
+    for keyword in keywords {
+        for node in keyword_nodes(keyword) {
+            push_unique(&mut subject, node);
+        }
+    }
+
+    let hierarchical =
+        (old.hierarchical.is_some() || keywords.iter().any(|k| is_path(k))).then(|| {
+            let old_hierarchical = old.hierarchical.as_deref().unwrap_or_default();
+            let old_nodes: HashSet<&str> = old_hierarchical
+                .iter()
+                .filter(|entry| !is_darktable_internal(entry))
+                .flat_map(|entry| keyword_nodes(entry))
+                .collect();
+            let old_subject: HashSet<&str> = old.subject.iter().map(|s| s.trim()).collect();
+            let mut out = Vec::new();
+            for keyword in keywords {
+                let synonym = !is_path(keyword)
+                    && old_subject.contains(keyword.as_str())
+                    && !old_nodes.contains(keyword.as_str());
+                if !synonym {
+                    push_unique(&mut out, keyword);
+                }
+            }
+            for entry in old_hierarchical {
+                if is_darktable_internal(entry) {
+                    push_unique(&mut out, entry);
+                }
+            }
+            out
+        });
+
+    let tags_list = old.tags_list.as_ref().map(|old_list| {
+        let wanted: HashSet<&str> = keywords.iter().map(String::as_str).collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut covered: HashSet<String> = HashSet::new();
+        for entry in old_list {
+            let mapped = entry.replace('/', &HIERARCHY_SEPARATOR.to_string());
+            if wanted.contains(mapped.as_str()) {
+                covered.insert(mapped);
+                push_unique(&mut out, entry);
+            }
+        }
+        for keyword in keywords {
+            if covered.contains(keyword) {
+                continue;
+            }
+            let nodes = keyword_nodes(keyword);
+            if nodes.iter().any(|node| node.contains('/')) {
+                continue;
+            }
+            push_unique(&mut out, &nodes.join("/"));
+        }
+        out
+    });
+
+    KeywordProperties {
+        subject,
+        hierarchical,
+        tags_list,
+    }
+}
+
+fn plan_upgrade(current: &[String], xmp: &[String]) -> (Vec<String>, HashSet<String>) {
+    let flat: HashSet<&str> = current
+        .iter()
+        .map(String::as_str)
+        .filter(|item| !is_path(item))
+        .collect();
+    let mut paths: Vec<String> = Vec::new();
+    let mut consumed: HashSet<&str> = HashSet::new();
+    for path in xmp.iter().filter(|p| is_path(p)) {
+        let nodes = keyword_nodes(path);
+        let Some(len) = (2..=nodes.len())
+            .rev()
+            .find(|len| nodes[..*len].iter().all(|node| flat.contains(node)))
+        else {
+            continue;
+        };
+        push_unique(&mut paths, &join_nodes(&nodes[..len]));
+        consumed.extend(&nodes[..len]);
+    }
+    let xmp_flat: HashSet<&str> = xmp
+        .iter()
+        .map(String::as_str)
+        .filter(|item| !is_path(item))
+        .collect();
+    let removed = consumed
+        .into_iter()
+        .filter(|node| !xmp_flat.contains(node))
+        .map(str::to_string)
+        .collect();
+    (paths, removed)
+}
+
+pub fn upgrade_keywords(current: &[String], xmp: &[String]) -> Option<Vec<String>> {
+    let (paths, removed) = plan_upgrade(current, xmp);
+    let mut result: Vec<String> = current
+        .iter()
+        .filter(|item| !removed.contains(item.as_str()))
+        .cloned()
+        .collect();
+    for path in &paths {
+        push_unique(&mut result, path);
+    }
+    (!same_set(&result, current)).then_some(result)
+}
+
+pub fn upgrade_tags(metadata: &mut ImageMetadata, xmp: &[String]) -> bool {
+    let Some(tags) = metadata.tags.as_ref() else {
+        return false;
+    };
+    let current = xmp_keywords(tags);
+    let (paths, removed) = plan_upgrade(&current, xmp);
+    if paths.is_empty() {
+        return false;
+    }
+    let mut upgraded: Vec<String> = tags
+        .iter()
+        .filter(|tag| {
+            tag.starts_with(COLOR_TAG_PREFIX)
+                || normalize_keyword(bare_name(tag))
+                    .is_none_or(|name| !removed.contains(name.as_str()))
+        })
+        .cloned()
+        .collect();
+    for path in &paths {
+        if !has_tag(&upgraded, path) {
+            upgraded.push(format!("{}{}", USER_TAG_PREFIX, path));
+        }
+    }
+    let changed = upgraded != *tags;
+    if changed {
+        metadata.tags = Some(upgraded);
+    }
+    changed
 }
 
 #[derive(Debug)]
@@ -843,8 +1091,10 @@ struct DescInfo {
     dc: Option<String>,
     dt: Option<String>,
     dk: Option<String>,
+    lr: Option<String>,
     xmp_clash: bool,
     dc_clash: bool,
+    lr_clash: bool,
 }
 
 #[derive(Default)]
@@ -859,6 +1109,8 @@ struct Scan {
     ratings: Vec<Occ>,
     labels: Vec<Occ>,
     subjects: Vec<SubjectOcc>,
+    hierarchical: Vec<SubjectOcc>,
+    tags_lists: Vec<SubjectOcc>,
     dt_labels: Vec<SubjectOcc>,
     dk_labels: Vec<Occ>,
     rdf: Option<RdfInfo>,
@@ -872,6 +1124,8 @@ enum Kind {
     Rating,
     Label,
     Subject,
+    Hierarchical,
+    TagsList,
     DtLabels,
     DkLabel,
     Container,
@@ -938,6 +1192,7 @@ struct Scanner<'a> {
     scan: Scan,
     stack: Vec<Kind>,
     cur: Option<Cursor>,
+    stray_text: bool,
 }
 
 impl<'a> Scanner<'a> {
@@ -985,6 +1240,10 @@ impl<'a> Scanner<'a> {
                     Kind::Label
                 } else if is_name(ns, NS_DC, local, &[b"subject"]) {
                     Kind::Subject
+                } else if is_name(ns, NS_LR, local, &[b"hierarchicalSubject"]) {
+                    Kind::Hierarchical
+                } else if is_name(ns, NS_DIGIKAM, local, &[b"TagsList"]) {
+                    Kind::TagsList
                 } else if is_name(ns, NS_DARKTABLE, local, &[b"colorlabels"]) {
                     Kind::DtLabels
                 } else if is_name(ns, NS_DIGIKAM, local, &[b"ColorLabel"]) {
@@ -993,8 +1252,22 @@ impl<'a> Scanner<'a> {
                     Kind::Other
                 }
             }
-            Some(Kind::Subject | Kind::DtLabels) => Kind::Container,
-            Some(Kind::Container) => Kind::Li,
+            Some(Kind::TagsList) => {
+                if is_name(ns, NS_RDF, local, &[b"Bag", b"Seq", b"Alt"]) {
+                    Kind::Container
+                } else {
+                    return Err(unsupported("digiKam:TagsList content"));
+                }
+            }
+            Some(Kind::Subject | Kind::Hierarchical | Kind::DtLabels) => Kind::Container,
+            Some(Kind::Container) => {
+                let in_tags_list =
+                    self.stack.len() >= 2 && self.stack[self.stack.len() - 2] == Kind::TagsList;
+                if in_tags_list && !is_name(ns, NS_RDF, local, &[b"li"]) {
+                    return Err(unsupported("digiKam:TagsList content"));
+                }
+                Kind::Li
+            }
             Some(Kind::Rating | Kind::Label | Kind::DkLabel | Kind::Li) => {
                 return Err(unsupported("child element in a text property"));
             }
@@ -1022,7 +1295,13 @@ impl<'a> Scanner<'a> {
                 }
             }
             Kind::Desc => self.open_desc(resolver, e, tag_start, name_end, qname, empty)?,
-            Kind::Rating | Kind::Label | Kind::DkLabel | Kind::Subject | Kind::DtLabels => {
+            Kind::Rating
+            | Kind::Label
+            | Kind::DkLabel
+            | Kind::Subject
+            | Kind::Hierarchical
+            | Kind::TagsList
+            | Kind::DtLabels => {
                 let attrs_end = self.attrs_end(e, name_end)?;
                 let tag_end = find_gt(content, attrs_end)?;
                 self.cur = Some(Cursor {
@@ -1113,6 +1392,10 @@ impl<'a> Scanner<'a> {
                 self.scan.labels.push(occ);
             } else if is_name(&attr_ns, NS_DIGIKAM, local.as_ref(), &[b"ColorLabel"]) {
                 self.scan.dk_labels.push(occ);
+            } else if is_name(&attr_ns, NS_DIGIKAM, local.as_ref(), &[b"TagsList"])
+                || is_name(&attr_ns, NS_LR, local.as_ref(), &[b"hierarchicalSubject"])
+            {
+                return Err(unsupported("keyword list as an attribute"));
             }
         }
 
@@ -1140,6 +1423,12 @@ impl<'a> Scanner<'a> {
             }
             if uri == NS_DIGIKAM && desc.dk.is_none() {
                 desc.dk = Some(prefix.clone());
+            }
+            if uri == NS_LR && desc.lr.is_none() {
+                desc.lr = Some(prefix.clone());
+            }
+            if prefix == "lr" && uri != NS_LR {
+                desc.lr_clash = true;
             }
             if prefix == "xmp" && uri != NS_XMP {
                 desc.xmp_clash = true;
@@ -1182,7 +1471,13 @@ impl<'a> Scanner<'a> {
                     cur.values.push(decoded.to_string());
                 }
             }
-            Kind::Rating | Kind::Label | Kind::DkLabel | Kind::Subject | Kind::DtLabels => {
+            Kind::Rating
+            | Kind::Label
+            | Kind::DkLabel
+            | Kind::Subject
+            | Kind::Hierarchical
+            | Kind::TagsList
+            | Kind::DtLabels => {
                 let cur = self
                     .cur
                     .take()
@@ -1200,16 +1495,17 @@ impl<'a> Scanner<'a> {
                     qname: cur.qname,
                 };
                 match kind {
-                    Kind::Subject | Kind::DtLabels => {
+                    Kind::Subject | Kind::Hierarchical | Kind::TagsList | Kind::DtLabels => {
                         let occ = SubjectOcc {
                             elem,
                             values: normalize_values(cur.values.iter().map(String::as_str)),
                             desc: cur.desc,
                         };
-                        if kind == Kind::Subject {
-                            self.scan.subjects.push(occ);
-                        } else {
-                            self.scan.dt_labels.push(occ);
+                        match kind {
+                            Kind::Subject => self.scan.subjects.push(occ),
+                            Kind::Hierarchical => self.scan.hierarchical.push(occ),
+                            Kind::TagsList => self.scan.tags_lists.push(occ),
+                            _ => self.scan.dt_labels.push(occ),
                         }
                     }
                     _ => {
@@ -1232,6 +1528,16 @@ impl<'a> Scanner<'a> {
     }
 
     fn push_text(&mut self, text: &str) {
+        let in_tags_list = match self.stack.last() {
+            Some(Kind::TagsList) => true,
+            Some(Kind::Container) => {
+                self.stack.len() >= 2 && self.stack[self.stack.len() - 2] == Kind::TagsList
+            }
+            _ => false,
+        };
+        if in_tags_list && !text.chars().all(is_xml_space) {
+            self.stray_text = true;
+        }
         if matches!(
             self.stack.last(),
             Some(Kind::Rating | Kind::Label | Kind::DkLabel | Kind::Li)
@@ -1249,6 +1555,7 @@ fn scan_xmp(content: &str) -> WriteResult<Scan> {
         scan: Scan::default(),
         stack: Vec::new(),
         cur: None,
+        stray_text: false,
     };
 
     loop {
@@ -1297,6 +1604,9 @@ fn scan_xmp(content: &str) -> WriteResult<Scan> {
         }
     }
 
+    if scanner.stray_text {
+        return Err(unsupported("digiKam:TagsList content"));
+    }
     Ok(scanner.scan)
 }
 
@@ -1384,6 +1694,61 @@ fn render_list(
         indent, rdf, container, nl, indent, qname
     ));
     out
+}
+
+fn old_keywords(scan: &Scan) -> OldKeywords {
+    fn union(occs: &[SubjectOcc]) -> Vec<String> {
+        let mut out = Vec::new();
+        for occ in occs {
+            for value in &occ.values {
+                push_unique(&mut out, value);
+            }
+        }
+        out
+    }
+    OldKeywords {
+        subject: union(&scan.subjects),
+        hierarchical: (!scan.hierarchical.is_empty()).then(|| union(&scan.hierarchical)),
+        tags_list: (!scan.tags_lists.is_empty()).then(|| union(&scan.tags_lists)),
+    }
+}
+
+fn rewrite_list(
+    editor: &mut Editor,
+    scan: &Scan,
+    occs: &[SubjectOcc],
+    items: &[String],
+    container: &str,
+    nl: &str,
+) -> WriteResult<bool> {
+    if items.is_empty() {
+        for occ in occs {
+            editor.remove(occ.elem.whole.clone());
+        }
+        return Ok(true);
+    }
+    if occs.len() == 1 && same_set(&occs[0].values, items) {
+        return Ok(true);
+    }
+    let Some(first) = occs.first() else {
+        return Ok(false);
+    };
+    let desc = &scan.descs[first.desc];
+    let rdf = desc
+        .rdf
+        .clone()
+        .ok_or_else(|| unsupported("rdf namespace has no prefix"))?;
+    let indent = line_indent(editor.content, first.elem.whole.start)
+        .or_else(|| desc.child_indent.clone())
+        .unwrap_or_else(|| format!("{} ", desc.indent.clone().unwrap_or_default()));
+    editor.replace(
+        first.elem.whole.clone(),
+        render_list(&first.elem.qname, &rdf, container, items, &indent, nl),
+    );
+    for occ in &occs[1..] {
+        editor.remove(occ.elem.whole.clone());
+    }
+    Ok(true)
 }
 
 fn same_set(a: &[String], b: &[String]) -> bool {
@@ -1515,12 +1880,13 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
         ));
     }
 
+    let props = keyword_properties(&values.keywords, &old_keywords(&scan));
     let mut subject_items: Option<Vec<String>> = None;
-    if values.keywords.is_empty() {
+    if props.subject.is_empty() {
         for occ in &scan.subjects {
             editor.remove(occ.elem.whole.clone());
         }
-    } else if scan.subjects.len() == 1 && same_set(&scan.subjects[0].values, &values.keywords) {
+    } else if scan.subjects.len() == 1 && same_set(&scan.subjects[0].values, &props.subject) {
     } else if let Some(first) = scan.subjects.first() {
         let desc = &scan.descs[first.desc];
         let rdf = desc
@@ -1532,14 +1898,7 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
             .unwrap_or_else(|| format!("{} ", desc.indent.clone().unwrap_or_default()));
         editor.replace(
             first.elem.whole.clone(),
-            render_list(
-                &first.elem.qname,
-                &rdf,
-                "Bag",
-                &values.keywords,
-                &indent,
-                nl,
-            ),
+            render_list(&first.elem.qname, &rdf, "Bag", &props.subject, &indent, nl),
         );
         for occ in &scan.subjects[1..] {
             editor.remove(occ.elem.whole.clone());
@@ -1547,8 +1906,22 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
     } else {
         subject_insert = true;
         needs_dc = true;
-        subject_items = Some(values.keywords.clone());
+        subject_items = Some(props.subject.clone());
     }
+
+    let mut hierarchical_insert: Option<Vec<String>> = None;
+    if let Some(items) = &props.hierarchical
+        && !rewrite_list(&mut editor, &scan, &scan.hierarchical, items, "Bag", nl)?
+    {
+        hierarchical_insert = Some(items.clone());
+    }
+    if let Some(items) = &props.tags_list {
+        rewrite_list(&mut editor, &scan, &scan.tags_lists, items, "Seq", nl)?;
+    }
+    let needs_lr = hierarchical_insert.is_some();
+    let after_subject = needs_lr
+        && !props.subject.is_empty()
+        && scan.subjects.first().is_some_and(|first| first.desc == 0);
 
     match target {
         Some(t) => {
@@ -1562,12 +1935,25 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
                 None => "dc".to_string(),
             };
             let dc_decl = t.dc.is_none() && needs_dc;
+            let lr_prefix = match &t.lr {
+                Some(p) => p.clone(),
+                None if needs_lr && t.lr_clash => {
+                    return Err(XmpWriteError::PrefixClash(
+                        "prefix lr is bound to another namespace".to_string(),
+                    ));
+                }
+                None => "lr".to_string(),
+            };
+            let lr_decl = t.lr.is_none() && needs_lr;
             let mut attrs: Vec<String> = Vec::new();
             if needs_xmp && xmp_decl {
                 attrs.push(attr("xmlns:xmp", NS_XMP_STR));
             }
             if dc_decl {
                 attrs.push(attr("xmlns:dc", NS_DC_STR));
+            }
+            if lr_decl {
+                attrs.push(attr("xmlns:lr", NS_LR_STR));
             }
             attrs.extend(rating_insert);
             attrs.extend(label_insert);
@@ -1632,6 +2018,44 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
                     )
                 ));
             }
+            if let (Some(items), Some(subject)) = (&hierarchical_insert, scan.subjects.first()) {
+                let rdf = t
+                    .rdf
+                    .clone()
+                    .ok_or_else(|| unsupported("rdf namespace has no prefix"))?;
+                let indent = line_indent(content, subject.elem.whole.start)
+                    .unwrap_or_else(|| child_indent.clone());
+                let list = render_list(
+                    &format!("{}:hierarchicalSubject", lr_prefix),
+                    &rdf,
+                    "Bag",
+                    items,
+                    &indent,
+                    nl,
+                );
+                if after_subject {
+                    let at = subject.elem.whole.end;
+                    editor.replace(at..at, format!("{nl}{indent}{list}"));
+                }
+            }
+            if let (Some(items), false) = (&hierarchical_insert, after_subject) {
+                let rdf = t
+                    .rdf
+                    .clone()
+                    .ok_or_else(|| unsupported("rdf namespace has no prefix"))?;
+                blocks.push(format!(
+                    "{}{}",
+                    child_indent,
+                    render_list(
+                        &format!("{}:hierarchicalSubject", lr_prefix),
+                        &rdf,
+                        "Bag",
+                        items,
+                        &child_indent,
+                        nl
+                    )
+                ));
+            }
             let block = (!blocks.is_empty()).then(|| blocks.join(nl));
 
             if t.self_closing {
@@ -1665,7 +2089,11 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
             }
         }
         None => {
-            if rating_insert.is_some() || label_insert.is_some() || subject_insert {
+            if rating_insert.is_some()
+                || label_insert.is_some()
+                || subject_insert
+                || hierarchical_insert.is_some()
+            {
                 let rdf = scan.rdf.as_ref().ok_or_else(|| parse_err("no rdf:RDF"))?;
                 let prefix = rdf
                     .prefix
@@ -1683,6 +2111,9 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
                     "<{0}:Description {0}:about=\"\" xmlns:xmp=\"{1}\" xmlns:dc=\"{2}\"",
                     prefix, NS_XMP_STR, NS_DC_STR
                 );
+                if hierarchical_insert.is_some() {
+                    open.push_str(&format!(" xmlns:lr=\"{}\"", NS_LR_STR));
+                }
                 if let Some(a) = &rating_insert {
                     open.push(' ');
                     open.push_str(a);
@@ -1691,11 +2122,32 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
                     open.push(' ');
                     open.push_str(a);
                 }
-                let body = if subject_insert {
+                let mut lists = Vec::new();
+                if subject_insert {
                     let items = subject_items.take().unwrap_or_default();
+                    lists.push(render_list(
+                        "dc:subject",
+                        &prefix,
+                        "Bag",
+                        &items,
+                        &child_indent,
+                        nl,
+                    ));
+                }
+                if let Some(items) = &hierarchical_insert {
+                    lists.push(render_list(
+                        "lr:hierarchicalSubject",
+                        &prefix,
+                        "Bag",
+                        items,
+                        &child_indent,
+                        nl,
+                    ));
+                }
+                let body = if !lists.is_empty() {
                     format!(
                         "{open}>{nl}{child_indent}{}{nl}{desc_indent}</{prefix}:Description>",
-                        render_list("dc:subject", &prefix, "Bag", &items, &child_indent, nl)
+                        lists.join(&format!("{nl}{child_indent}"))
                     )
                 } else {
                     format!("{open}/>")
@@ -1734,8 +2186,21 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
     if !label_ok {
         return Err(XmpWriteError::Verify("label differs".to_string()));
     }
-    if !same_set(&after.subject, &values.keywords) {
+    if !same_set(&after.subject, &props.subject) {
         return Err(XmpWriteError::Verify("keywords differ".to_string()));
+    }
+    if let Some(items) = &props.hierarchical
+        && !same_set(&after.hierarchical_subject, items)
+    {
+        return Err(XmpWriteError::Verify(
+            "hierarchical keywords differ".to_string(),
+        ));
+    }
+    if let Some(items) = &props.tags_list {
+        let rescan = scan_xmp(&out).map_err(|e| XmpWriteError::Verify(e.to_string()))?;
+        if !same_set(&old_keywords(&rescan).tags_list.unwrap_or_default(), items) {
+            return Err(XmpWriteError::Verify("digiKam tags differ".to_string()));
+        }
     }
     Ok(Some(out))
 }
@@ -1790,7 +2255,7 @@ pub(crate) enum ConflictChoice {
     Write,
 }
 
-fn normalize_keyword(value: &str) -> &str {
+fn bare_name(value: &str) -> &str {
     let value = value.trim();
     value.strip_prefix(USER_TAG_PREFIX).unwrap_or(value).trim()
 }
@@ -1798,9 +2263,7 @@ fn normalize_keyword(value: &str) -> &str {
 pub(crate) fn normalize_keywords<S: AsRef<str>>(keywords: &[S]) -> Vec<String> {
     let set: BTreeSet<String> = keywords
         .iter()
-        .map(|k| normalize_keyword(k.as_ref()))
-        .filter(|k| !k.is_empty())
-        .map(str::to_string)
+        .filter_map(|k| normalize_keyword(bare_name(k.as_ref())))
         .collect();
     set.into_iter().collect()
 }
@@ -1851,7 +2314,7 @@ pub(crate) fn xmp_state(fields: &XmpFields, base: &XmpSyncState) -> XmpSyncState
     XmpSyncState::new(
         rating,
         xmp_color(fields).map(str::to_string),
-        fields.subject.clone(),
+        merge_keywords(&fields.subject, &fields.hierarchical_subject),
     )
 }
 
@@ -1895,8 +2358,10 @@ fn set_rating(metadata: &mut ImageMetadata, rating: u8) {
 }
 
 fn has_tag(tags: &[String], keyword: &str) -> bool {
-    tags.iter()
-        .any(|t| !t.starts_with(COLOR_TAG_PREFIX) && normalize_keyword(t) == keyword)
+    tags.iter().any(|t| {
+        !t.starts_with(COLOR_TAG_PREFIX)
+            && normalize_keyword(bare_name(t)).as_deref() == Some(keyword)
+    })
 }
 
 fn is_synced_keyword(name: &str) -> bool {
@@ -1951,16 +2416,16 @@ pub(crate) fn apply_state(
         if t.starts_with(COLOR_TAG_PREFIX) {
             return true;
         }
-        let name = normalize_keyword(t);
-        !is_synced_keyword(name) || wanted.contains(name)
+        let name = normalize_keyword(bare_name(t)).unwrap_or_default();
+        !is_synced_keyword(&name) || wanted.contains(name.as_str())
     });
     if let Some(legacy) = legacy_names {
         for tag in tags.iter_mut() {
             if tag.starts_with(COLOR_TAG_PREFIX) || tag.starts_with(USER_TAG_PREFIX) {
                 continue;
             }
-            let name = normalize_keyword(tag);
-            if legacy.contains(name) {
+            let name = normalize_keyword(bare_name(tag)).unwrap_or_default();
+            if legacy.contains(&name) {
                 *tag = format!("{}{}", USER_TAG_PREFIX, name);
             }
         }
@@ -1994,7 +2459,7 @@ fn decode_legacy_tags(metadata: &mut ImageMetadata, subject: &[String]) -> bool 
         } else {
             ""
         };
-        let name = normalize_keyword(tag);
+        let name = bare_name(tag);
         let decoded = match unescape(name) {
             Ok(decoded) if decoded != name && subject.iter().any(|s| s.trim() == decoded) => {
                 format!("{}{}", prefix, decoded)
@@ -2085,12 +2550,26 @@ impl ReadSidecar {
     }
 }
 
+fn upgrade_hierarchy(metadata: &mut ImageMetadata, fields: &XmpFields) {
+    let xmp = normalize_keywords(&merge_keywords(
+        &fields.subject,
+        &fields.hierarchical_subject,
+    ));
+    upgrade_tags(metadata, &xmp);
+    if let Some(base) = metadata.xmp_sync.as_mut()
+        && let Some(upgraded) = upgrade_keywords(&base.state.keywords, &xmp)
+    {
+        base.state.keywords = normalize_keywords(&upgraded);
+    }
+}
+
 fn read_sidecar(path: PathBuf, metadata: &mut ImageMetadata) -> Result<ReadSidecar, String> {
     let content = fs::read_to_string(&path)
         .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
     let fields =
         parse_xmp(&content).map_err(|e| format!("failed to parse {}: {}", path.display(), e))?;
     decode_legacy_tags(metadata, &fields.subject);
+    upgrade_hierarchy(metadata, &fields);
     Ok(ReadSidecar::new(path, content, &fields, metadata))
 }
 
@@ -2117,6 +2596,7 @@ pub(crate) fn sync_on_load(
     let side = match read_xmp_file(&path) {
         Ok(fields) => {
             decode_legacy_tags(metadata, &fields.subject);
+            upgrade_hierarchy(metadata, &fields);
             ReadSidecar::new(path, String::new(), &fields, metadata)
         }
         Err(e) => {
@@ -2195,6 +2675,7 @@ pub(crate) fn sync_on_save(
         return false;
     };
     let tags_before = metadata.tags.clone();
+    let base_before = metadata.xmp_sync.clone();
     let side = match read_sidecar(path, metadata) {
         Ok(side) => side,
         Err(e) => {
@@ -2202,7 +2683,7 @@ pub(crate) fn sync_on_save(
             return false;
         }
     };
-    let decoded = metadata.tags != tags_before;
+    let decoded = metadata.tags != tags_before || metadata.xmp_sync != base_before;
 
     let rr = rr_state(metadata);
     let first_sync = side.base.is_none();

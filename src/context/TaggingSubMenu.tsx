@@ -8,6 +8,7 @@ import Text from '../components/ui/Text';
 import { TextVariants } from '../types/typography';
 import { useLibraryStore } from '../store/useLibraryStore';
 import { expandGroupedPaths } from '../utils/imageGrouping';
+import { normalizeTag } from '../utils/tags';
 
 interface TaggingSubMenuProps {
   paths: string[];
@@ -48,7 +49,7 @@ export default function TaggingSubMenu({
     expandGroupedPaths(useLibraryStore.getState().imageList, paths, appSettings?.grouping ?? 'off');
 
   const handleAddTag = async (tagToAdd: string) => {
-    const newTagValue = tagToAdd.trim().toLowerCase();
+    const newTagValue = normalizeTag(tagToAdd.trim().toLowerCase());
     if (newTagValue && !tags.some((t) => t.tag === newTagValue)) {
       try {
         const prefixedTag = `${USER_TAG_PREFIX}${newTagValue}`;

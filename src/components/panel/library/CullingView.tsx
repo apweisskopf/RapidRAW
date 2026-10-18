@@ -31,6 +31,7 @@ import { useSettingsStore } from '../../../store/useSettingsStore';
 import { useLibraryActions } from '../../../hooks/useLibraryActions';
 import { COLOR_LABELS, Color } from '../../../utils/adjustments';
 import { expandGroupedPaths } from '../../../utils/imageGrouping';
+import { normalizeTag } from '../../../utils/tags';
 import { IconAperture, IconFocalLength, IconIso, IconShutter } from '../editor/ExifIcons';
 
 interface SyncViewport {
@@ -168,7 +169,7 @@ function CullingPreview({
   const imageHeight = (image as any).height || image.exif?.ExifImageHeight || image.exif?.PixelYDimension;
 
   const handleAddTag = async (tagToAdd: string) => {
-    const newTagValue = tagToAdd.trim().toLowerCase();
+    const newTagValue = normalizeTag(tagToAdd.trim().toLowerCase());
     if (newTagValue && !currentTags.some((t) => t.tag === newTagValue)) {
       try {
         const prefixedTag = `${USER_TAG_PREFIX}${newTagValue}`;

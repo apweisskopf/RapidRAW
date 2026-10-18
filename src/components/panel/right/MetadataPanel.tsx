@@ -18,6 +18,7 @@ import { useSettingsStore } from '../../../store/useSettingsStore';
 import { useProcessStore } from '../../../store/useProcessStore';
 import { useLibraryActions } from '../../../hooks/useLibraryActions';
 import { expandGroupedPaths } from '../../../utils/imageGrouping';
+import { normalizeTag } from '../../../utils/tags';
 
 interface CameraSetting {
   format?(value: number): string | number;
@@ -471,7 +472,7 @@ export default function MetadataPanel() {
       : null;
 
   const handleAddTag = async (tagToAdd: string) => {
-    const newTagValue = tagToAdd.trim().toLowerCase();
+    const newTagValue = normalizeTag(tagToAdd.trim().toLowerCase());
     if (newTagValue && !currentTags.some((t) => t.tag === newTagValue)) {
       try {
         const prefixedTag = `${USER_TAG_PREFIX}${newTagValue}`;

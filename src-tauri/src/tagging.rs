@@ -477,6 +477,9 @@ pub fn add_tag_for_paths(
     tag: String,
     app_handle: AppHandle,
 ) -> Result<(), String> {
+    let Some(tag) = crate::xmp_sidecar::normalize_user_tag(&tag) else {
+        return Ok(());
+    };
     let sibling_cache = SiblingCache::new();
     paths.par_iter().for_each(|path| {
         let tag_clone = tag.clone();
@@ -498,10 +501,20 @@ pub fn remove_tag_for_paths(
     app_handle: AppHandle,
 ) -> Result<(), String> {
     let sibling_cache = SiblingCache::new();
+    let normalized = tag
+        .starts_with(USER_TAG_PREFIX)
+        .then(|| crate::xmp_sidecar::normalize_user_tag(&tag))
+        .flatten();
     paths.par_iter().for_each(|path| {
         let tag_clone = tag.clone();
         if let Err(e) = modify_tags_for_path(path, &app_handle, &sibling_cache, |tags| {
-            tags.retain(|t| t != &tag_clone);
+            tags.retain(|t| {
+                t != &tag_clone
+                    && normalized.as_ref().is_none_or(|target| {
+                        crate::xmp_sidecar::normalize_user_tag(t).as_ref() != Some(target)
+                            || !t.starts_with(USER_TAG_PREFIX)
+                    })
+            });
         }) {
             eprintln!("Failed to remove tag from {}: {}", path, e);
         }
