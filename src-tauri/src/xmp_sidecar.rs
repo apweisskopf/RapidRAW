@@ -18,6 +18,12 @@ const NS_RDF: &[u8] = b"http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const NS_XMP: &[u8] = b"http://ns.adobe.com/xap/1.0/";
 const NS_DC: &[u8] = b"http://purl.org/dc/elements/1.1/";
 const NS_X: &[u8] = b"adobe:ns:meta/";
+const NS_DARKTABLE: &[u8] = b"http://darktable.sf.net/";
+const NS_DIGIKAM: &[u8] = b"http://www.digikam.org/ns/1.0/";
+
+pub(crate) fn is_darktable_internal(tag: &str) -> bool {
+    tag.starts_with("darktable|")
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct XmpFields {
@@ -25,6 +31,9 @@ pub struct XmpFields {
     pub label: Option<String>,
     pub subject: Vec<String>,
     pub rating_invalid: bool,
+    pub darktable_colorlabels: Option<Vec<String>>,
+    pub digikam_color_label: Option<String>,
+    pub darktable_ns: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -35,6 +44,8 @@ enum Ctx {
     Rating,
     Label,
     Subject,
+    DtLabels,
+    DkLabel,
     Container,
     Li,
     Ignored,
@@ -140,33 +151,52 @@ impl Collector {
                     Ctx::Label
                 } else if is_name(ns, NS_DC, local, &[b"subject"]) {
                     Ctx::Subject
+                } else if is_name(ns, NS_DARKTABLE, local, &[b"colorlabels"]) {
+                    Ctx::DtLabels
+                } else if is_name(ns, NS_DIGIKAM, local, &[b"ColorLabel"]) {
+                    Ctx::DkLabel
                 } else {
                     Ctx::Ignored
                 }
             }
-            Some(Ctx::Subject) => {
+            Some(Ctx::Subject | Ctx::DtLabels) => {
                 if is_name(ns, NS_RDF, local, &[b"Bag", b"Seq", b"Alt"]) {
                     Ctx::Container
                 } else {
-                    return Err("unsupported dc:subject content".to_string());
+                    return Err("unsupported list property content".to_string());
                 }
             }
             Some(Ctx::Container) => {
                 if is_name(ns, NS_RDF, local, &[b"li"]) {
                     Ctx::Li
                 } else {
-                    return Err("unsupported dc:subject list content".to_string());
+                    return Err("unsupported list content".to_string());
                 }
             }
-            Some(Ctx::Li) | Some(Ctx::Rating) | Some(Ctx::Label) => {
+            Some(Ctx::Li) | Some(Ctx::Rating) | Some(Ctx::Label) | Some(Ctx::DkLabel) => {
                 return Err("unexpected child element in a text property".to_string());
             }
             Some(Ctx::Ignored) => Ctx::Ignored,
         };
 
         match ctx {
-            Ctx::Desc => self.desc_props.clear(),
-            Ctx::Rating | Ctx::Label | Ctx::Subject => self.mark(ctx)?,
+            Ctx::Desc => {
+                self.desc_props.clear();
+                if self.stack.last() == Some(&Ctx::Rdf)
+                    && resolver
+                        .bindings()
+                        .any(|(_, namespace)| namespace.into_inner() == NS_DARKTABLE)
+                {
+                    self.fields.darktable_ns = true;
+                }
+            }
+            Ctx::Rating | Ctx::Label | Ctx::Subject | Ctx::DkLabel => self.mark(ctx)?,
+            Ctx::DtLabels => {
+                self.mark(ctx)?;
+                self.fields
+                    .darktable_colorlabels
+                    .get_or_insert_with(Vec::new);
+            }
             _ => {}
         }
 
@@ -192,9 +222,20 @@ impl Collector {
                         self.set_label(&value);
                     } else if is_name(&attr_ns, NS_DC, local_attr, &[b"subject"]) {
                         return Err("dc:subject as an attribute".to_string());
+                    } else if is_name(&attr_ns, NS_DIGIKAM, local_attr, &[b"ColorLabel"]) {
+                        self.mark(Ctx::DkLabel)?;
+                        self.fields.digikam_color_label = Some(value.trim().to_string());
+                    } else if is_name(&attr_ns, NS_DARKTABLE, local_attr, &[b"colorlabels"]) {
+                        return Err("darktable:colorlabels as an attribute".to_string());
                     }
                 }
-                Ctx::Rating | Ctx::Label | Ctx::Subject | Ctx::Container | Ctx::Li
+                Ctx::Rating
+                | Ctx::Label
+                | Ctx::Subject
+                | Ctx::DtLabels
+                | Ctx::DkLabel
+                | Ctx::Container
+                | Ctx::Li
                     if attr_ns.as_deref() == Some(NS_RDF) =>
                 {
                     return Err("unsupported rdf attribute on a property".to_string());
@@ -204,7 +245,7 @@ impl Collector {
         }
 
         self.stack.push(ctx);
-        if matches!(ctx, Ctx::Rating | Ctx::Label | Ctx::Li) {
+        if matches!(ctx, Ctx::Rating | Ctx::Label | Ctx::DkLabel | Ctx::Li) {
             self.text.clear();
         }
         Ok(())
@@ -215,16 +256,25 @@ impl Collector {
             .stack
             .pop()
             .ok_or_else(|| "unexpected end tag".to_string())?;
-        if matches!(ctx, Ctx::Rating | Ctx::Label | Ctx::Li) {
+        if matches!(ctx, Ctx::Rating | Ctx::Label | Ctx::DkLabel | Ctx::Li) {
             let raw = std::mem::take(&mut self.text);
             let decoded = unescape(&raw).map_err(|err| err.to_string())?;
             let value = decoded.trim();
-            if !value.is_empty() {
+            if ctx == Ctx::DkLabel {
+                self.fields.digikam_color_label = Some(value.to_string());
+            } else if !value.is_empty() {
                 match ctx {
                     Ctx::Rating => self.set_rating(value),
                     Ctx::Label => self.set_label(value),
                     _ => {
-                        if !self.fields.subject.iter().any(|t| t == value) {
+                        let owner = self.stack.iter().rev().nth(1).copied();
+                        if owner == Some(Ctx::DtLabels) {
+                            if let Some(labels) = self.fields.darktable_colorlabels.as_mut() {
+                                labels.push(value.to_string());
+                            }
+                        } else if !is_darktable_internal(value)
+                            && !self.fields.subject.iter().any(|t| t == value)
+                        {
                             self.fields.subject.push(value.to_string());
                         }
                     }
@@ -239,11 +289,11 @@ impl Collector {
 
     fn text(&mut self, raw: &str) -> Result<(), String> {
         let allowed: fn(char) -> bool = match self.stack.last() {
-            Some(Ctx::Rating | Ctx::Label | Ctx::Li) => {
+            Some(Ctx::Rating | Ctx::Label | Ctx::DkLabel | Ctx::Li) => {
                 self.text.push_str(raw);
                 return Ok(());
             }
-            Some(Ctx::Subject | Ctx::Container) => is_xml_space,
+            Some(Ctx::Subject | Ctx::DtLabels | Ctx::Container) => is_xml_space,
             None if self.root_closed => |c| is_xml_space(c) || c == '\0',
             None => |c| is_xml_space(c) || c == '\u{feff}',
             _ => return Ok(()),
@@ -367,6 +417,49 @@ const NEW_XMP: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 pub(crate) fn normalize_label(value: &str) -> Option<String> {
     let label = value.trim().to_lowercase();
     RAPIDRAW_COLORS.contains(&label.as_str()).then_some(label)
+}
+
+const DIGIKAM_COLORS: [(&str, &str); 5] = [
+    ("red", "1"),
+    ("yellow", "3"),
+    ("green", "4"),
+    ("blue", "5"),
+    ("purple", "6"),
+];
+
+fn darktable_color(value: &str) -> Option<&'static str> {
+    let index = value.trim().parse::<usize>().ok()?;
+    RAPIDRAW_COLORS.get(index).copied()
+}
+
+fn digikam_color(value: &str) -> Option<&'static str> {
+    let value = value.trim();
+    DIGIKAM_COLORS
+        .iter()
+        .find(|(_, code)| *code == value)
+        .map(|(color, _)| *color)
+}
+
+fn digikam_code(color: &str) -> &'static str {
+    DIGIKAM_COLORS
+        .iter()
+        .find(|(name, _)| *name == color)
+        .map_or("0", |(_, code)| code)
+}
+
+fn darktable_index(color: &str) -> Option<usize> {
+    RAPIDRAW_COLORS.iter().position(|name| *name == color)
+}
+
+pub(crate) fn xmp_color(fields: &XmpFields) -> Option<&'static str> {
+    if let Some(items) = &fields.darktable_colorlabels {
+        return items.iter().find_map(|item| darktable_color(item));
+    }
+    if let Some(code) = &fields.digikam_color_label {
+        return digikam_color(code);
+    }
+    let label = normalize_label(fields.label.as_deref()?)?;
+    RAPIDRAW_COLORS.iter().copied().find(|c| *c == label)
 }
 
 fn valid_xml_text(value: &str) -> bool {
@@ -500,6 +593,8 @@ struct DescInfo {
     rdf: Option<String>,
     xmp: Option<String>,
     dc: Option<String>,
+    dt: Option<String>,
+    dk: Option<String>,
     xmp_clash: bool,
     dc_clash: bool,
 }
@@ -516,6 +611,8 @@ struct Scan {
     ratings: Vec<Occ>,
     labels: Vec<Occ>,
     subjects: Vec<SubjectOcc>,
+    dt_labels: Vec<SubjectOcc>,
+    dk_labels: Vec<Occ>,
     rdf: Option<RdfInfo>,
 }
 
@@ -527,6 +624,8 @@ enum Kind {
     Rating,
     Label,
     Subject,
+    DtLabels,
+    DkLabel,
     Container,
     Li,
     Other,
@@ -638,13 +737,17 @@ impl<'a> Scanner<'a> {
                     Kind::Label
                 } else if is_name(ns, NS_DC, local, &[b"subject"]) {
                     Kind::Subject
+                } else if is_name(ns, NS_DARKTABLE, local, &[b"colorlabels"]) {
+                    Kind::DtLabels
+                } else if is_name(ns, NS_DIGIKAM, local, &[b"ColorLabel"]) {
+                    Kind::DkLabel
                 } else {
                     Kind::Other
                 }
             }
-            Some(Kind::Subject) => Kind::Container,
+            Some(Kind::Subject | Kind::DtLabels) => Kind::Container,
             Some(Kind::Container) => Kind::Li,
-            Some(Kind::Rating | Kind::Label | Kind::Li) => {
+            Some(Kind::Rating | Kind::Label | Kind::DkLabel | Kind::Li) => {
                 return Err(unsupported("child element in a text property"));
             }
             Some(Kind::Other) => Kind::Other,
@@ -671,7 +774,7 @@ impl<'a> Scanner<'a> {
                 }
             }
             Kind::Desc => self.open_desc(resolver, e, tag_start, name_end, qname, empty)?,
-            Kind::Rating | Kind::Label | Kind::Subject => {
+            Kind::Rating | Kind::Label | Kind::DkLabel | Kind::Subject | Kind::DtLabels => {
                 let attrs_end = self.attrs_end(e, name_end)?;
                 let tag_end = find_gt(content, attrs_end)?;
                 self.cur = Some(Cursor {
@@ -760,6 +863,8 @@ impl<'a> Scanner<'a> {
                 self.scan.ratings.push(occ);
             } else if is_name(&attr_ns, NS_XMP, local.as_ref(), &[b"Label"]) {
                 self.scan.labels.push(occ);
+            } else if is_name(&attr_ns, NS_DIGIKAM, local.as_ref(), &[b"ColorLabel"]) {
+                self.scan.dk_labels.push(occ);
             }
         }
 
@@ -781,6 +886,12 @@ impl<'a> Scanner<'a> {
             }
             if uri == NS_DC && desc.dc.is_none() {
                 desc.dc = Some(prefix.clone());
+            }
+            if uri == NS_DARKTABLE && desc.dt.is_none() {
+                desc.dt = Some(prefix.clone());
+            }
+            if uri == NS_DIGIKAM && desc.dk.is_none() {
+                desc.dk = Some(prefix.clone());
             }
             if prefix == "xmp" && uri != NS_XMP {
                 desc.xmp_clash = true;
@@ -823,7 +934,7 @@ impl<'a> Scanner<'a> {
                     cur.values.push(decoded.to_string());
                 }
             }
-            Kind::Rating | Kind::Label | Kind::Subject => {
+            Kind::Rating | Kind::Label | Kind::DkLabel | Kind::Subject | Kind::DtLabels => {
                 let cur = self
                     .cur
                     .take()
@@ -841,21 +952,28 @@ impl<'a> Scanner<'a> {
                     qname: cur.qname,
                 };
                 match kind {
-                    Kind::Subject => self.scan.subjects.push(SubjectOcc {
-                        elem,
-                        values: normalize_values(cur.values.iter().map(String::as_str)),
-                        desc: cur.desc,
-                    }),
+                    Kind::Subject | Kind::DtLabels => {
+                        let occ = SubjectOcc {
+                            elem,
+                            values: normalize_values(cur.values.iter().map(String::as_str)),
+                            desc: cur.desc,
+                        };
+                        if kind == Kind::Subject {
+                            self.scan.subjects.push(occ);
+                        } else {
+                            self.scan.dt_labels.push(occ);
+                        }
+                    }
                     _ => {
                         let raw = unescape(&cur.text).map_err(parse_err)?;
                         let occ = Occ {
                             loc: Loc::Elem(elem),
                             decoded: raw.trim().to_string(),
                         };
-                        if kind == Kind::Rating {
-                            self.scan.ratings.push(occ);
-                        } else {
-                            self.scan.labels.push(occ);
+                        match kind {
+                            Kind::Rating => self.scan.ratings.push(occ),
+                            Kind::DkLabel => self.scan.dk_labels.push(occ),
+                            _ => self.scan.labels.push(occ),
                         }
                     }
                 }
@@ -868,7 +986,7 @@ impl<'a> Scanner<'a> {
     fn push_text(&mut self, text: &str) {
         if matches!(
             self.stack.last(),
-            Some(Kind::Rating | Kind::Label | Kind::Li)
+            Some(Kind::Rating | Kind::Label | Kind::DkLabel | Kind::Li)
         ) && let Some(cur) = self.cur.as_mut()
         {
             cur.text.push_str(text);
@@ -888,8 +1006,10 @@ fn scan_xmp(content: &str) -> WriteResult<Scan> {
     loop {
         let (res, event) = reader.read_resolved_event().map_err(parse_err)?;
         let ns = bound(res).map_err(parse_err)?;
-        if matches!(scanner.stack.last(), Some(Kind::Rating | Kind::Label))
-            && matches!(event, Event::Comment(_) | Event::PI(_) | Event::DocType(_))
+        if matches!(
+            scanner.stack.last(),
+            Some(Kind::Rating | Kind::Label | Kind::DkLabel)
+        ) && matches!(event, Event::Comment(_) | Event::PI(_) | Event::DocType(_))
         {
             return Err(unsupported("markup inside xmp:Rating or xmp:Label"));
         }
@@ -992,8 +1112,15 @@ impl Editor<'_> {
     }
 }
 
-fn render_subject(qname: &str, rdf: &str, items: &[String], indent: &str, nl: &str) -> String {
-    let mut out = format!("<{}>{}{} <{}:Bag>{}", qname, nl, indent, rdf, nl);
+fn render_list(
+    qname: &str,
+    rdf: &str,
+    container: &str,
+    items: &[String],
+    indent: &str,
+    nl: &str,
+) -> String {
+    let mut out = format!("<{}>{}{} <{}:{}>{}", qname, nl, indent, rdf, container, nl);
     for item in items {
         out.push_str(&format!(
             "{}  <{}:li>{}</{}:li>{}",
@@ -1005,8 +1132,8 @@ fn render_subject(qname: &str, rdf: &str, items: &[String], indent: &str, nl: &s
         ));
     }
     out.push_str(&format!(
-        "{} </{}:Bag>{}{}</{}>",
-        indent, rdf, nl, indent, qname
+        "{} </{}:{}>{}{}</{}>",
+        indent, rdf, container, nl, indent, qname
     ));
     out
 }
@@ -1058,30 +1185,78 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
         }
     }
 
-    let mut kept_label: Option<String> = None;
-    match &values.label {
-        Some(label) => {
-            let escaped = escape(label.as_str()).to_string();
-            if scan.labels.is_empty() {
-                needs_xmp = true;
-                label_insert = Some(attr(&format!("{}:Label", xmp_prefix), &escaped));
+    let rr_color = values.label.as_deref().and_then(normalize_label);
+    let legacy_label = values.label.is_some() && rr_color.is_none();
+    let file_color = xmp_color(&before);
+    let mut dt_insert: Option<String> = None;
+    let mut dk_insert: Option<String> = None;
+    if let (true, Some(label)) = (legacy_label, &values.label) {
+        let escaped = escape(label.as_str()).to_string();
+        if scan.labels.is_empty() {
+            needs_xmp = true;
+            label_insert = Some(attr(&format!("{}:Label", xmp_prefix), &escaped));
+        }
+        for occ in &scan.labels {
+            if occ.decoded.to_lowercase() != label.to_lowercase() {
+                editor.set_value(&occ.loc, &escaped);
             }
-            for occ in &scan.labels {
-                if occ.decoded.to_lowercase() != label.to_lowercase() {
-                    editor.set_value(&occ.loc, &escaped);
+        }
+    } else if rr_color.as_deref() != file_color {
+        let dt_target = target.and_then(|t| t.dt.clone());
+        let dk_target = target.and_then(|t| t.dk.clone());
+        for occ in &scan.dt_labels {
+            match (&rr_color, &occ.desc) {
+                (Some(color), desc) => {
+                    let rdf = scan.descs[*desc]
+                        .rdf
+                        .clone()
+                        .ok_or_else(|| unsupported("rdf namespace has no prefix"))?;
+                    let indent = line_indent(content, occ.elem.whole.start).unwrap_or_default();
+                    let index = darktable_index(color).unwrap_or(0).to_string();
+                    editor.replace(
+                        occ.elem.whole.clone(),
+                        render_list(&occ.elem.qname, &rdf, "Seq", &[index], &indent, nl),
+                    );
+                }
+                (None, _) => editor.remove(occ.elem.whole.clone()),
+            }
+        }
+        for occ in &scan.dk_labels {
+            let code = rr_color.as_deref().map_or("0", digikam_code);
+            if occ.decoded != code {
+                editor.set_value(&occ.loc, code);
+            }
+        }
+        for occ in &scan.labels {
+            match (&rr_color, &values.label) {
+                (Some(_), Some(label)) => {
+                    if occ.decoded.to_lowercase() != label.to_lowercase() {
+                        editor.set_value(&occ.loc, &escape(label.as_str()));
+                    }
+                }
+                _ => {
+                    if normalize_label(&occ.decoded).is_some() {
+                        match &occ.loc {
+                            Loc::Attr(a) => editor.remove(a.whole.clone()),
+                            Loc::Elem(el) => editor.remove(el.whole.clone()),
+                        }
+                    }
                 }
             }
         }
-        None => {
-            for occ in &scan.labels {
-                if normalize_label(&occ.decoded).is_some() {
-                    match &occ.loc {
-                        Loc::Attr(a) => editor.remove(a.whole.clone()),
-                        Loc::Elem(el) => editor.remove(el.whole.clone()),
-                    }
-                } else if kept_label.is_none() && !occ.decoded.is_empty() {
-                    kept_label = Some(occ.decoded.clone());
-                }
+        let no_field =
+            scan.dt_labels.is_empty() && scan.dk_labels.is_empty() && scan.labels.is_empty();
+        if let (true, Some(color), Some(label)) = (no_field, &rr_color, &values.label) {
+            if dt_target.is_some() {
+                dt_insert = Some(darktable_index(color).unwrap_or(0).to_string());
+            } else if dk_target.is_some() {
+                dk_insert = Some(digikam_code(color).to_string());
+            } else {
+                needs_xmp = true;
+                label_insert = Some(attr(
+                    &format!("{}:Label", xmp_prefix),
+                    &escape(label.as_str()),
+                ));
             }
         }
     }
@@ -1109,7 +1284,14 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
             .unwrap_or_else(|| format!("{} ", desc.indent.clone().unwrap_or_default()));
         editor.replace(
             first.elem.whole.clone(),
-            render_subject(&first.elem.qname, &rdf, &values.keywords, &indent, nl),
+            render_list(
+                &first.elem.qname,
+                &rdf,
+                "Bag",
+                &values.keywords,
+                &indent,
+                nl,
+            ),
         );
         for occ in &scan.subjects[1..] {
             editor.remove(occ.elem.whole.clone());
@@ -1141,6 +1323,9 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
             }
             attrs.extend(rating_insert);
             attrs.extend(label_insert);
+            if let (Some(code), Some(dk)) = (&dk_insert, &t.dk) {
+                attrs.push(attr(&format!("{}:ColorLabel", dk), code));
+            }
             let attr_indent = t
                 .attr_indent
                 .clone()
@@ -1161,26 +1346,45 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
                 .child_indent
                 .clone()
                 .unwrap_or_else(|| format!("{} ", desc_indent));
-            let block = if subject_insert {
+            let mut blocks: Vec<String> = Vec::new();
+            if let (Some(index), Some(dt)) = (&dt_insert, &t.dt) {
+                let rdf = t
+                    .rdf
+                    .clone()
+                    .ok_or_else(|| unsupported("rdf namespace has no prefix"))?;
+                blocks.push(format!(
+                    "{}{}",
+                    child_indent,
+                    render_list(
+                        &format!("{}:colorlabels", dt),
+                        &rdf,
+                        "Seq",
+                        std::slice::from_ref(index),
+                        &child_indent,
+                        nl
+                    )
+                ));
+            }
+            if subject_insert {
                 let rdf = t
                     .rdf
                     .clone()
                     .ok_or_else(|| unsupported("rdf namespace has no prefix"))?;
                 let items = subject_items.take().unwrap_or_default();
-                Some(format!(
+                blocks.push(format!(
                     "{}{}",
                     child_indent,
-                    render_subject(
+                    render_list(
                         &format!("{}:subject", dc_prefix),
                         &rdf,
+                        "Bag",
                         &items,
                         &child_indent,
                         nl
                     )
-                ))
-            } else {
-                None
-            };
+                ));
+            }
+            let block = (!blocks.is_empty()).then(|| blocks.join(nl));
 
             if t.self_closing {
                 if let Some(block) = block {
@@ -1243,7 +1447,7 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
                     let items = subject_items.take().unwrap_or_default();
                     format!(
                         "{open}>{nl}{child_indent}{}{nl}{desc_indent}</{prefix}:Description>",
-                        render_subject("dc:subject", &prefix, &items, &child_indent, nl)
+                        render_list("dc:subject", &prefix, "Bag", &items, &child_indent, nl)
                     )
                 } else {
                     format!("{open}/>")
@@ -1272,12 +1476,12 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
     if !rating_ok {
         return Err(XmpWriteError::Verify("rating differs".to_string()));
     }
-    let label_ok = match (&after.label, &values.label, &kept_label) {
-        (Some(a), Some(v), _) => a.to_lowercase() == v.to_lowercase(),
-        (None, Some(_), _) => false,
-        (Some(a), None, Some(k)) => a.to_lowercase() == k.to_lowercase(),
-        (None, None, None) => true,
-        _ => false,
+    let label_ok = match (&values.label, legacy_label) {
+        (Some(v), true) => after
+            .label
+            .as_ref()
+            .is_some_and(|a| a.to_lowercase() == v.to_lowercase()),
+        _ => xmp_color(&after) == rr_color.as_deref(),
     };
     if !label_ok {
         return Err(XmpWriteError::Verify("label differs".to_string()));
@@ -1396,7 +1600,11 @@ pub(crate) fn xmp_state(fields: &XmpFields, base: &XmpSyncState) -> XmpSyncState
     } else {
         fields.rating.unwrap_or(0)
     };
-    XmpSyncState::new(rating, fields.label.clone(), fields.subject.clone())
+    XmpSyncState::new(
+        rating,
+        xmp_color(fields).map(str::to_string),
+        fields.subject.clone(),
+    )
 }
 
 pub(crate) fn classify(
