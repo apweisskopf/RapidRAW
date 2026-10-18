@@ -19,7 +19,7 @@ use little_exif::filetype::FileExtension;
 use little_exif::ifd::ExifTagGroup;
 use little_exif::metadata::Metadata;
 use little_exif::rational::{iR64, uR64};
-use quick_xml::escape::{escape, unescape};
+use quick_xml::escape::escape;
 use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer};
 use rawler::decoders::RawMetadata;
@@ -1746,13 +1746,11 @@ fn read_source_xmp(path: &Path) -> Option<String> {
 fn build_export_xmp(xmp: &ExportXmp, source_xmp: Option<&str>) -> Option<String> {
     let mut keywords = xmp.keywords.clone();
     for tag in source_xmp
-        .map(xmp_sidecar::extract_xmp_tags)
+        .and_then(|source| xmp_sidecar::parse_xmp(source).ok())
+        .map(|fields| fields.subject)
         .unwrap_or_default()
     {
-        push_keyword(
-            &mut keywords,
-            &unescape(&tag).unwrap_or(Cow::Borrowed(&tag)),
-        );
+        push_keyword(&mut keywords, &tag);
     }
 
     let description = export_xmp_description(xmp, &keywords);
