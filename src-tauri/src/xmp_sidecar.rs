@@ -909,14 +909,23 @@ pub fn keyword_properties(keywords: &[String], old: &OldKeywords) -> KeywordProp
 
     let tags_list = old.tags_list.as_ref().map(|old_list| {
         let wanted: HashSet<&str> = keywords.iter().map(String::as_str).collect();
+        let read_keywords = old
+            .subject
+            .iter()
+            .any(|item| !item.trim().is_empty() && !is_darktable_internal(item.trim()));
         let mut out: Vec<String> = Vec::new();
         let mut covered: HashSet<String> = HashSet::new();
         for entry in old_list {
             let mapped = entry.replace('/', &HIERARCHY_SEPARATOR.to_string());
+            let leaf = entry.rsplit('/').next().unwrap_or(entry).trim();
             if wanted.contains(mapped.as_str()) {
                 covered.insert(mapped);
-                push_unique(&mut out, entry);
+            } else if !is_path(leaf) && wanted.contains(leaf) {
+                covered.insert(leaf.to_string());
+            } else if read_keywords {
+                continue;
             }
+            push_unique(&mut out, entry);
         }
         for keyword in keywords {
             if covered.contains(keyword) {
