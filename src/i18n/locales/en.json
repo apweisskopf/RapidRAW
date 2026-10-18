@@ -751,7 +751,19 @@
         "tags": "Tags",
         "title": "Organization"
       },
-      "title": "Metadata"
+      "title": "Metadata",
+      "xmpConflict": {
+        "description": "RapidRAW and the XMP sidecar were both changed. Pick which values to keep.",
+        "keywords": "Keywords",
+        "label": "Label",
+        "rapidraw": "RapidRAW",
+        "rating": "Rating",
+        "rejected": "Rejected",
+        "title": "XMP Conflict",
+        "useRapidraw": "Use RapidRAW",
+        "useXmp": "Use XMP",
+        "xmp": "XMP"
+      }
     },
     "presets": {
       "amount": "Amount",
@@ -1142,7 +1154,8 @@
       "tooltipFocalLength": "Focal Length",
       "tooltipIso": "ISO",
       "tooltipShutterSpeed": "Shutter Speed",
-      "tooltipVirtualCopy": "Virtual Copy"
+      "tooltipVirtualCopy": "Virtual Copy",
+      "xmpConflict": "XMP conflict, open the metadata panel to resolve"
     },
     "reject": {
       "deleteConfirm": "Delete Rejected",

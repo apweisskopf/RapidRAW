@@ -81,6 +81,10 @@ pub struct ImageMetadata {
     pub tags: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exif: Option<std::collections::HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xmp_sync: Option<crate::xmp_sidecar::XmpSyncBase>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub xmp_conflict: bool,
 }
 
 impl Default for ImageMetadata {
@@ -92,6 +96,8 @@ impl Default for ImageMetadata {
             adjustments: Value::Null,
             tags: None,
             exif: None,
+            xmp_sync: None,
+            xmp_conflict: false,
         }
     }
 }

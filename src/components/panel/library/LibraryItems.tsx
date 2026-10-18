@@ -9,6 +9,7 @@ import {
   SlidersHorizontal,
   CloudOff,
   Layers,
+  TriangleAlert,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useTranslation } from 'react-i18next';
@@ -47,6 +48,7 @@ const ThumbnailComponent = ({
   isEdited,
   exif,
   isCloudPlaceholder,
+  xmpConflict,
   groupBadgeLabel,
   onAspectRatioLoaded,
 }: any) => {
@@ -280,6 +282,18 @@ const ThumbnailComponent = ({
             data-tooltip={t('library.items.cloudPlaceholder')}
           >
             <CloudOff size={12} className="text-white" />
+          </div>
+        )}
+
+        {xmpConflict && (
+          <div
+            className={clsx(
+              'absolute top-1.5 z-10 rounded-full h-5 w-5 flex items-center justify-center bg-black/40 shadow-md',
+              isCloudPlaceholder && layers.length > 0 ? 'left-7' : 'left-1.5',
+            )}
+            data-tooltip={t('library.items.xmpConflict')}
+          >
+            <TriangleAlert size={12} className="text-yellow-400" />
           </div>
         )}
       </div>
@@ -1041,6 +1055,7 @@ const RowComponent = ({
                 isEdited={imageFile.is_edited}
                 aspectRatio={thumbnailAspectRatio}
                 isCloudPlaceholder={imageFile.is_cloud_placeholder}
+                xmpConflict={imageFile.xmp_conflict}
                 groupBadgeLabel={imageFile.group_id && groupBadgeInfo?.get(imageFile.group_id)?.label}
                 onAspectRatioLoaded={onAspectRatioLoaded}
               />

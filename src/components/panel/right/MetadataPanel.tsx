@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Check, ChevronDown, ChevronRight, Plus, Star, Tag, X, User } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, Plus, Star, Tag, X, User, TriangleAlert } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import clsx from 'clsx';
@@ -9,6 +9,7 @@ import FlagToggles from '../../ui/FlagToggles';
 import { getImageFlag } from '../../../utils/imageFlags';
 import { COLOR_LABELS, Color } from '../../../utils/adjustments';
 import Text from '../../ui/Text';
+import Button from '../../ui/Button';
 import { TextColors, TextVariants, TextWeights } from '../../../types/typography';
 import { IconAperture, IconShutter, IconIso, IconFocalLength, IconLens } from '../editor/ExifIcons';
 import { useEditorStore } from '../../../store/useEditorStore';
@@ -45,6 +46,117 @@ interface MetaDataItemProps {
 
 const USER_TAG_PREFIX = 'user:';
 const EMPTY_TAGS: string[] = [];
+
+interface XmpSyncState {
+  rating: number;
+  label?: string;
+  keywords?: Array<string>;
+}
+
+interface XmpConflictInfo {
+  rr: XmpSyncState;
+  xmp: XmpSyncState;
+}
+
+interface XmpConflictBarProps {
+  path: string;
+  refreshKey: string;
+  getPaths(): Array<string>;
+}
+
+function XmpConflictBar({ path, refreshKey, getPaths }: XmpConflictBarProps) {
+  const { t } = useTranslation();
+  const [info, setInfo] = useState<XmpConflictInfo | null>(null);
+  const [isResolving, setIsResolving] = useState(false);
+
+  useEffect(() => {
+    let isActive = true;
+    invoke<XmpConflictInfo | null>(Invokes.GetXmpConflict, { path })
+      .then((result) => {
+        if (isActive) setInfo(result);
+      })
+      .catch((err) => {
+        console.error(`Failed to load XMP conflict: ${err}`);
+        if (isActive) setInfo(null);
+      });
+    return () => {
+      isActive = false;
+    };
+  }, [path, refreshKey]);
+
+  const resolve = async (command: Invokes) => {
+    setIsResolving(true);
+    try {
+      await invoke(command, { paths: getPaths() });
+    } catch (err) {
+      console.error(`Failed to resolve XMP conflict: ${err}`);
+    } finally {
+      setIsResolving(false);
+    }
+  };
+
+  const formatRating = (state: XmpSyncState) =>
+    state.rating < 0 ? t('editor.metadata.xmpConflict.rejected') : state.rating > 0 ? `${state.rating} ★` : '-';
+  const formatLabel = (state: XmpSyncState) =>
+    state.label ? state.label.charAt(0).toUpperCase() + state.label.slice(1) : '-';
+  const formatKeywords = (state: XmpSyncState) => (state.keywords?.length ? state.keywords.join(', ') : '-');
+
+  const rows = [
+    { label: t('editor.metadata.xmpConflict.rating'), format: formatRating },
+    { label: t('editor.metadata.xmpConflict.label'), format: formatLabel },
+    { label: t('editor.metadata.xmpConflict.keywords'), format: formatKeywords },
+  ];
+
+  return (
+    <div className="bg-surface border border-yellow-500/40 rounded-xl p-3.5 flex flex-col gap-3">
+      <div className="flex items-center gap-2">
+        <TriangleAlert size={16} className="text-yellow-400 shrink-0" />
+        <Text weight={TextWeights.semibold} color={TextColors.primary}>
+          {t('editor.metadata.xmpConflict.title')}
+        </Text>
+      </div>
+      <Text variant={TextVariants.small} color={TextColors.secondary}>
+        {t('editor.metadata.xmpConflict.description')}
+      </Text>
+      {info && (
+        <div className="grid grid-cols-[auto_1fr_1fr] gap-x-3 gap-y-1">
+          <span />
+          <Text variant={TextVariants.small} weight={TextWeights.semibold}>
+            {t('editor.metadata.xmpConflict.rapidraw')}
+          </Text>
+          <Text variant={TextVariants.small} weight={TextWeights.semibold}>
+            {t('editor.metadata.xmpConflict.xmp')}
+          </Text>
+          {rows.map((row) => (
+            <div key={row.label} className="contents">
+              <Text variant={TextVariants.small} color={TextColors.secondary}>
+                {row.label}
+              </Text>
+              <Text variant={TextVariants.small} className="break-words">
+                {row.format(info.rr)}
+              </Text>
+              <Text variant={TextVariants.small} className="break-words">
+                {row.format(info.xmp)}
+              </Text>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="flex gap-2">
+        <Button
+          className="py-1.5 flex-1 bg-surface text-text-primary"
+          disabled={isResolving}
+          onClick={() => resolve(Invokes.XmpConflictWrite)}
+        >
+          {t('editor.metadata.xmpConflict.useRapidraw')}
+        </Button>
+        <Button className="py-1.5 flex-1" disabled={isResolving} onClick={() => resolve(Invokes.XmpConflictImport)}>
+          {t('editor.metadata.xmpConflict.useXmp')}
+        </Button>
+      </div>
+    </div>
+  );
+}
 
 function formatExifTag(str: string) {
   if (!str) return '';
@@ -254,6 +366,9 @@ export default function MetadataPanel() {
     if (!selectedImage) return EMPTY_TAGS;
     return state.imageList.find((img) => img.path === selectedImage.path)?.tags ?? EMPTY_TAGS;
   });
+  const xmpConflict = useLibraryStore(
+    (state) => !!selectedImage && !!state.imageList.find((img) => img.path === selectedImage.path)?.xmp_conflict,
+  );
   const liveThumbnailUrl = selectedImage ? thumbnails[selectedImage.path] : undefined;
 
   const targetPaths = multiSelectedPaths?.length > 0 ? multiSelectedPaths : selectedImage ? [selectedImage.path] : [];
@@ -403,6 +518,13 @@ export default function MetadataPanel() {
       <div className="grow overflow-y-auto p-3 custom-scrollbar">
         {selectedImage ? (
           <div className="flex flex-col gap-6">
+            {xmpConflict && (
+              <XmpConflictBar
+                path={selectedImage.path}
+                refreshKey={JSON.stringify([rating, flag, tags])}
+                getPaths={getPathsToUpdate}
+              />
+            )}
             <div>
               <Text variant={TextVariants.heading} className="mb-3">
                 {t('editor.metadata.fileInfo.title')}

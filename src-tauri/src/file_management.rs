@@ -90,6 +90,19 @@ struct ImageFileMetadata {
     rating: u8,
     flag: Option<ImageFlag>,
     is_raw: bool,
+    xmp_conflict: bool,
+}
+
+fn edited_state(
+    image_path: &Path,
+    metadata: &ImageMetadata,
+    settings: &AppSettings,
+) -> (bool, bool) {
+    let is_raw = crate::formats::is_raw_file(image_path);
+    let tm_override = crate::image_processing::resolve_tonemapper_override(settings, is_raw);
+    let is_edited =
+        crate::image_processing::is_image_edited(&metadata.adjustments, is_raw, tm_override);
+    (is_edited, is_raw)
 }
 
 fn resolve_image_metadata(
@@ -99,25 +112,63 @@ fn resolve_image_metadata(
     settings: &AppSettings,
 ) -> ImageFileMetadata {
     let mut metadata = crate::exif_processing::load_sidecar(sidecar_path);
+    let virtual_copy = is_virtual_copy(sidecar_path, image_path);
 
     if enable_xmp_sync
-        && !is_virtual_copy(sidecar_path, image_path)
-        && crate::xmp_sidecar::sync_metadata_from_xmp(image_path, &mut metadata)
+        && !virtual_copy
+        && crate::xmp_sidecar::sync_on_load(image_path, &mut metadata)
     {
         let _ = crate::exif_processing::write_sidecar(sidecar_path, image_path, &metadata);
     }
 
-    let is_raw = crate::formats::is_raw_file(image_path);
-    let tm_override = crate::image_processing::resolve_tonemapper_override(settings, is_raw);
-    let is_edited =
-        crate::image_processing::is_image_edited(&metadata.adjustments, is_raw, tm_override);
+    let (is_edited, is_raw) = edited_state(image_path, &metadata, settings);
     ImageFileMetadata {
         is_edited,
         tags: metadata.tags,
         rating: metadata.rating,
         flag: metadata.flag,
         is_raw,
+        xmp_conflict: metadata.xmp_conflict && !virtual_copy,
     }
+}
+
+pub(crate) fn write_sidecar_and_xmp(
+    source_path: &Path,
+    sidecar_path: &Path,
+    metadata: &mut ImageMetadata,
+    settings: &AppSettings,
+) -> std::io::Result<bool> {
+    let mut changed = false;
+    if is_virtual_copy(sidecar_path, source_path) {
+        metadata.xmp_sync = None;
+        metadata.xmp_conflict = false;
+    } else if settings.enable_xmp_sync.unwrap_or(false) {
+        let conflict_before = metadata.xmp_conflict;
+        let create_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
+        changed = crate::xmp_sidecar::sync_on_save(source_path, metadata, create_if_missing)
+            || metadata.xmp_conflict != conflict_before;
+    }
+    crate::exif_processing::write_sidecar(sidecar_path, source_path, metadata)?;
+    Ok(changed)
+}
+
+pub(crate) fn emit_synced_metadata(
+    app_handle: &AppHandle,
+    path: &str,
+    source_path: &Path,
+    metadata: &ImageMetadata,
+    settings: &AppSettings,
+) {
+    let (is_edited, _) = edited_state(source_path, metadata, settings);
+    emit_image_metadata_loaded(
+        app_handle,
+        path,
+        metadata.rating,
+        metadata.flag,
+        is_edited,
+        &metadata.tags,
+        metadata.xmp_conflict,
+    );
 }
 
 fn emit_image_metadata_loaded(
@@ -127,10 +178,11 @@ fn emit_image_metadata_loaded(
     flag: Option<ImageFlag>,
     is_edited: bool,
     tags: &Option<Vec<String>>,
+    xmp_conflict: bool,
 ) {
     let _ = app_handle.emit(
         "image-metadata-loaded",
-        serde_json::json!({ "path": path, "rating": rating, "flag": flag, "is_edited": is_edited, "tags": tags }),
+        serde_json::json!({ "path": path, "rating": rating, "flag": flag, "is_edited": is_edited, "tags": tags, "xmp_conflict": xmp_conflict }),
     );
 }
 
@@ -197,6 +249,7 @@ pub fn start_metadata_workers(app_handle: tauri::AppHandle) {
                     metadata.flag,
                     metadata.is_edited,
                     &metadata.tags,
+                    metadata.xmp_conflict,
                 );
 
                 manager_clone
@@ -298,6 +351,7 @@ pub struct ImageFile {
     is_cloud_placeholder: bool,
     is_raw: bool,
     group_id: Option<String>,
+    xmp_conflict: bool,
 }
 
 fn make_group_key(source_path: &Path) -> String {
@@ -666,6 +720,7 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
                         rating: 0,
                         flag: None,
                         is_raw: crate::formats::is_raw_file(&path_buf),
+                        xmp_conflict: false,
                     }
                 } else {
                     resolve_image_metadata(&path_buf, &sidecar_path, enable_xmp_sync, &settings)
@@ -683,6 +738,7 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
                     rating: metadata.rating,
                     flag: metadata.flag,
                     is_cloud_placeholder,
+                    xmp_conflict: metadata.xmp_conflict,
                 });
             }
 
@@ -789,6 +845,7 @@ pub fn list_images_recursive(
                         rating: 0,
                         flag: None,
                         is_raw: crate::formats::is_raw_file(&path_buf),
+                        xmp_conflict: false,
                     }
                 } else {
                     resolve_image_metadata(&path_buf, &sidecar_path, enable_xmp_sync, &settings)
@@ -806,6 +863,7 @@ pub fn list_images_recursive(
                     rating: metadata.rating,
                     flag: metadata.flag,
                     is_cloud_placeholder,
+                    xmp_conflict: metadata.xmp_conflict,
                 });
             }
 
@@ -1062,6 +1120,7 @@ pub fn get_album_images(
                     rating: 0,
                     flag: None,
                     is_raw: crate::formats::is_raw_file(&source_path),
+                    xmp_conflict: false,
                 }
             } else {
                 resolve_image_metadata(&source_path, &sidecar_path, enable_xmp_sync, &settings)
@@ -1079,6 +1138,7 @@ pub fn get_album_images(
                 rating: metadata.rating,
                 flag: metadata.flag,
                 is_cloud_placeholder,
+                xmp_conflict: metadata.xmp_conflict,
             })
         })
         .collect();
@@ -2579,19 +2639,11 @@ pub fn save_metadata_and_update_thumbnail(
 
     metadata.adjustments = final_adjustments;
 
-    crate::exif_processing::write_sidecar(&sidecar_path, &source_path, &metadata)
-        .map_err(|e| e.to_string())?;
-
-    if let Ok(settings) = load_settings(app_handle.clone())
-        && settings.enable_xmp_sync.unwrap_or(false)
+    let settings = load_settings(app_handle.clone()).unwrap_or_default();
+    if write_sidecar_and_xmp(&source_path, &sidecar_path, &mut metadata, &settings)
+        .map_err(|e| e.to_string())?
     {
-        let create_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
-        crate::xmp_sidecar::sync_metadata_to_xmp(
-            &sidecar_path,
-            &source_path,
-            &metadata,
-            create_if_missing,
-        );
+        emit_synced_metadata(&app_handle, &path, &source_path, &metadata, &settings);
     }
 
     let loaded_image_lock = state.original_image.lock().unwrap();
@@ -2668,8 +2720,6 @@ pub async fn apply_adjustments_to_paths(
 
     tauri::async_runtime::spawn_blocking(move || {
         let settings = load_settings(app_handle.clone()).unwrap_or_default();
-        let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
-        let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
 
         let lens_db = app_handle
             .state::<AppState>()
@@ -2705,18 +2755,18 @@ pub async fn apply_adjustments_to_paths(
 
             existing_metadata.adjustments = new_adjustments;
 
-            let _ = crate::exif_processing::write_sidecar(
-                &sidecar_path,
+            if let Ok(true) = write_sidecar_and_xmp(
                 &source_path,
-                &existing_metadata,
-            );
-
-            if enable_xmp_sync {
-                crate::xmp_sidecar::sync_metadata_to_xmp(
-                    &sidecar_path,
+                &sidecar_path,
+                &mut existing_metadata,
+                &settings,
+            ) {
+                emit_synced_metadata(
+                    &app_handle,
+                    path,
                     &source_path,
                     &existing_metadata,
-                    create_xmp_if_missing,
+                    &settings,
                 );
             }
         });
@@ -2737,8 +2787,6 @@ pub async fn reset_adjustments_for_paths(
 
     tauri::async_runtime::spawn_blocking(move || {
         let settings = load_settings(app_handle.clone()).unwrap_or_default();
-        let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
-        let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
 
         paths.par_iter().for_each(|path| {
             let (source_path, sidecar_path) = parse_virtual_path(path);
@@ -2747,18 +2795,18 @@ pub async fn reset_adjustments_for_paths(
 
             existing_metadata.adjustments = default_adjustments();
 
-            let _ = crate::exif_processing::write_sidecar(
-                &sidecar_path,
+            if let Ok(true) = write_sidecar_and_xmp(
                 &source_path,
-                &existing_metadata,
-            );
-
-            if enable_xmp_sync {
-                crate::xmp_sidecar::sync_metadata_to_xmp(
-                    &sidecar_path,
+                &sidecar_path,
+                &mut existing_metadata,
+                &settings,
+            ) {
+                emit_synced_metadata(
+                    &app_handle,
+                    path,
                     &source_path,
                     &existing_metadata,
-                    create_xmp_if_missing,
+                    &settings,
                 );
             }
         });
@@ -2823,8 +2871,6 @@ pub async fn apply_auto_lens_correction_to_paths(
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
-    let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
-    let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
     let lens_db = app_handle
         .state::<AppState>()
         .lens_db
@@ -2833,7 +2879,11 @@ pub async fn apply_auto_lens_correction_to_paths(
         .clone();
 
     let sidecar_paths = paths.clone();
+    let sidecar_settings = settings.clone();
+    let sidecar_app_handle = app_handle.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let settings = sidecar_settings;
+        let app_handle = sidecar_app_handle;
         sidecar_paths.par_iter().for_each(|path| {
             let (source_path, sidecar_path) = parse_virtual_path(path);
             let mut existing_metadata =
@@ -2856,18 +2906,18 @@ pub async fn apply_auto_lens_correction_to_paths(
                 lens_db.as_deref(),
             );
 
-            let _ = crate::exif_processing::write_sidecar(
-                &sidecar_path,
+            if let Ok(true) = write_sidecar_and_xmp(
                 &source_path,
-                &existing_metadata,
-            );
-
-            if enable_xmp_sync {
-                crate::xmp_sidecar::sync_metadata_to_xmp(
-                    &sidecar_path,
+                &sidecar_path,
+                &mut existing_metadata,
+                &settings,
+            ) {
+                emit_synced_metadata(
+                    &app_handle,
+                    path,
                     &source_path,
                     &existing_metadata,
-                    create_xmp_if_missing,
+                    &settings,
                 );
             }
         });
@@ -2897,8 +2947,6 @@ async fn update_sidecars_from_images(
 
     tauri::async_runtime::spawn_blocking(move || {
         let settings = load_settings(app_handle.clone()).unwrap_or_default();
-        let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
-        let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
 
         let state = app_handle.state::<AppState>();
         let thumb_cache_dir = match resolve_thumbnail_cache_dir(&app_handle) {
@@ -2945,18 +2993,18 @@ async fn update_sidecars_from_images(
                     &mut existing_metadata.adjustments,
                 );
 
-                let _ = crate::exif_processing::write_sidecar(
-                    &sidecar_path,
+                if let Ok(true) = write_sidecar_and_xmp(
                     &source_path,
-                    &existing_metadata,
-                );
-
-                if enable_xmp_sync {
-                    crate::xmp_sidecar::sync_metadata_to_xmp(
-                        &sidecar_path,
+                    &sidecar_path,
+                    &mut existing_metadata,
+                    &settings,
+                ) {
+                    emit_synced_metadata(
+                        &app_handle,
+                        path,
                         &source_path,
                         &existing_metadata,
-                        create_xmp_if_missing,
+                        &settings,
                     );
                 }
                 Ok(image)
@@ -3071,8 +3119,6 @@ fn update_metadata_for_paths(
     update: impl Fn(&mut ImageMetadata) + Sync,
 ) {
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
-    let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
-    let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
 
     paths.par_iter().for_each(|path| {
         let (source_path, sidecar_path) = parse_virtual_path(path);
@@ -3081,15 +3127,10 @@ fn update_metadata_for_paths(
 
         update(&mut metadata);
 
-        let _ = crate::exif_processing::write_sidecar(&sidecar_path, &source_path, &metadata);
-
-        if enable_xmp_sync {
-            crate::xmp_sidecar::sync_metadata_to_xmp(
-                &sidecar_path,
-                &source_path,
-                &metadata,
-                create_xmp_if_missing,
-            );
+        if let Ok(true) =
+            write_sidecar_and_xmp(&source_path, &sidecar_path, &mut metadata, &settings)
+        {
+            emit_synced_metadata(app_handle, path, &source_path, &metadata, &settings);
         }
     });
 }
@@ -3157,12 +3198,79 @@ pub fn load_metadata(path: String, app_handle: AppHandle) -> Result<ImageMetadat
 
     if enable_xmp_sync
         && !is_virtual_copy(&sidecar_path, &source_path)
-        && crate::xmp_sidecar::sync_metadata_from_xmp(&source_path, &mut metadata)
+        && crate::xmp_sidecar::sync_on_load(&source_path, &mut metadata)
     {
         let _ = crate::exif_processing::write_sidecar(&sidecar_path, &source_path, &metadata);
     }
 
     Ok(metadata)
+}
+
+#[tauri::command]
+pub fn get_xmp_conflict(
+    path: String,
+) -> Result<Option<crate::xmp_sidecar::XmpConflictInfo>, String> {
+    let (source_path, sidecar_path) = parse_virtual_path(&path);
+    if is_virtual_copy(&sidecar_path, &source_path) {
+        return Ok(None);
+    }
+    let metadata = crate::exif_processing::load_sidecar(&sidecar_path);
+    crate::xmp_sidecar::xmp_conflict_info(&source_path, &metadata)
+}
+
+fn resolve_xmp_conflicts(
+    paths: &[String],
+    app_handle: &AppHandle,
+    choice: crate::xmp_sidecar::ConflictChoice,
+) -> Result<(), String> {
+    let settings = load_settings(app_handle.clone()).unwrap_or_default();
+    let mut errors = Vec::new();
+    for path in paths {
+        let (source_path, sidecar_path) = parse_virtual_path(path);
+        if is_virtual_copy(&sidecar_path, &source_path) {
+            continue;
+        }
+        let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
+        if !metadata.xmp_conflict {
+            continue;
+        }
+        if let Err(e) =
+            crate::xmp_sidecar::resolve_xmp_conflict(&source_path, &mut metadata, choice)
+        {
+            errors.push(e);
+            continue;
+        }
+        if let Err(e) =
+            crate::exif_processing::write_sidecar(&sidecar_path, &source_path, &metadata)
+        {
+            errors.push(format!("cannot write {}: {}", sidecar_path.display(), e));
+            continue;
+        }
+        emit_synced_metadata(app_handle, path, &source_path, &metadata, &settings);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+#[tauri::command]
+pub fn xmp_conflict_import(paths: Vec<String>, app_handle: AppHandle) -> Result<(), String> {
+    resolve_xmp_conflicts(
+        &paths,
+        &app_handle,
+        crate::xmp_sidecar::ConflictChoice::Import,
+    )
+}
+
+#[tauri::command]
+pub fn xmp_conflict_write(paths: Vec<String>, app_handle: AppHandle) -> Result<(), String> {
+    resolve_xmp_conflicts(
+        &paths,
+        &app_handle,
+        crate::xmp_sidecar::ConflictChoice::Write,
+    )
 }
 
 fn get_presets_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {

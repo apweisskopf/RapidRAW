@@ -446,18 +446,16 @@ fn modify_tags_for_path(
         metadata.tags = Some(tags);
     }
 
-    crate::exif_processing::write_sidecar(&sidecar_path, &source_path, &metadata)
-        .map_err(|e| e.to_string())?;
-
-    if let Ok(settings) = crate::load_settings(app_handle.clone())
-        && settings.enable_xmp_sync.unwrap_or(false)
+    let settings = crate::load_settings(app_handle.clone()).unwrap_or_default();
+    if file_management::write_sidecar_and_xmp(&source_path, &sidecar_path, &mut metadata, &settings)
+        .map_err(|e| e.to_string())?
     {
-        let create_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
-        crate::xmp_sidecar::sync_metadata_to_xmp(
-            &sidecar_path,
+        file_management::emit_synced_metadata(
+            app_handle,
+            path_str,
             &source_path,
             &metadata,
-            create_if_missing,
+            &settings,
         );
     }
 
@@ -507,29 +505,15 @@ fn rrdata_source_path(rrdata: &Path) -> Option<PathBuf> {
     Some(rrdata.with_file_name(source_filename))
 }
 
-fn sync_xmp_for_rrdata(
+fn write_rrdata(
     rrdata_path: &Path,
-    metadata: &ImageMetadata,
-    enable_xmp_sync: bool,
-    create_xmp_if_missing: bool,
-) {
-    if !enable_xmp_sync {
-        return;
-    }
-    if let Some(source_path) = rrdata_source_path(rrdata_path) {
-        crate::xmp_sidecar::sync_metadata_to_xmp(
-            rrdata_path,
-            &source_path,
-            metadata,
-            create_xmp_if_missing,
-        );
-    }
-}
-
-fn write_rrdata(rrdata_path: &Path, metadata: &ImageMetadata) -> std::io::Result<()> {
+    metadata: &mut ImageMetadata,
+    settings: &crate::app_settings::AppSettings,
+) -> std::io::Result<()> {
     match rrdata_source_path(rrdata_path) {
         Some(source_path) => {
-            crate::exif_processing::write_sidecar(rrdata_path, &source_path, metadata)
+            file_management::write_sidecar_and_xmp(&source_path, rrdata_path, metadata, settings)
+                .map(|_| ())
         }
         None => {
             let json_string =
@@ -546,8 +530,6 @@ pub fn clear_ai_tags(root_path: String, app_handle: AppHandle) -> Result<usize, 
     }
 
     let settings = crate::load_settings(app_handle.clone()).unwrap_or_default();
-    let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
-    let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
 
     let mut updated_count = 0;
     let walker = WalkDir::new(root_path).into_iter();
@@ -570,9 +552,8 @@ pub fn clear_ai_tags(root_path: String, app_handle: AppHandle) -> Result<usize, 
                 if tags.is_empty() {
                     metadata.tags = None;
                 }
-                if write_rrdata(path, &metadata).is_ok() {
+                if write_rrdata(path, &mut metadata, &settings).is_ok() {
                     updated_count += 1;
-                    sync_xmp_for_rrdata(path, &metadata, enable_xmp_sync, create_xmp_if_missing);
                 }
             }
         }
@@ -587,8 +568,6 @@ pub fn clear_all_tags(root_path: String, app_handle: AppHandle) -> Result<usize,
     }
 
     let settings = crate::load_settings(app_handle.clone()).unwrap_or_default();
-    let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
-    let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
 
     let mut updated_count = 0;
     let walker = WalkDir::new(root_path).into_iter();
@@ -609,9 +588,8 @@ pub fn clear_all_tags(root_path: String, app_handle: AppHandle) -> Result<usize,
                 if tags.is_empty() {
                     metadata.tags = None;
                 }
-                if write_rrdata(path, &metadata).is_ok() {
+                if write_rrdata(path, &mut metadata, &settings).is_ok() {
                     updated_count += 1;
-                    sync_xmp_for_rrdata(path, &metadata, enable_xmp_sync, create_xmp_if_missing);
                 }
             }
         }

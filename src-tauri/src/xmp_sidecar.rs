@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -8,8 +8,9 @@ use quick_xml::escape::{escape, unescape};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::{NamespaceResolver, PrefixDeclaration, ResolveResult};
 use quick_xml::reader::NsReader;
+use serde::{Deserialize, Serialize};
 
-use crate::file_management::{is_virtual_copy, write_atomic};
+use crate::file_management::write_atomic;
 use crate::image_processing::{ImageFlag, ImageMetadata, default_adjustments};
 use crate::tagging::{COLOR_TAG_PREFIX, USER_TAG_PREFIX};
 
@@ -23,6 +24,7 @@ pub struct XmpFields {
     pub rating: Option<i8>,
     pub label: Option<String>,
     pub subject: Vec<String>,
+    pub rating_invalid: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -63,6 +65,7 @@ struct Collector {
     root_seen: bool,
     root_closed: bool,
     desc_props: Vec<Ctx>,
+    rating_unparsed: bool,
 }
 
 fn is_xml_space(c: char) -> bool {
@@ -71,10 +74,11 @@ fn is_xml_space(c: char) -> bool {
 
 impl Collector {
     fn set_rating(&mut self, value: &str) {
-        if self.fields.rating.is_none()
-            && let Ok(rating) = value.trim().parse::<i8>()
-        {
-            self.fields.rating = Some(rating);
+        if self.fields.rating.is_none() {
+            match value.trim().parse::<i8>() {
+                Ok(rating) => self.fields.rating = Some(rating),
+                Err(_) => self.rating_unparsed = true,
+            }
         }
     }
 
@@ -288,6 +292,10 @@ pub fn parse_xmp(content: &str) -> Result<XmpFields, String> {
     if !state.root_closed || !state.stack.is_empty() {
         return Err("unexpected end of file".to_string());
     }
+    state.fields.rating_invalid = match state.fields.rating {
+        Some(rating) => rating > 5,
+        None => state.rating_unparsed,
+    };
     Ok(state.fields)
 }
 
@@ -339,79 +347,6 @@ pub fn resolve_xmp_path(image_path: &Path) -> Option<PathBuf> {
     } else {
         None
     }
-}
-
-pub fn sync_metadata_from_xmp(source_path: &Path, metadata: &mut ImageMetadata) -> bool {
-    let Some(xmp_file) = resolve_xmp_path(source_path) else {
-        return false;
-    };
-    let fields = match read_xmp_file(&xmp_file) {
-        Ok(fields) => fields,
-        Err(e) => {
-            log::warn!("Skipping XMP sync: {}", e);
-            return false;
-        }
-    };
-
-    let mut changed = false;
-    let xmp_rating = fields.rating;
-
-    if xmp_rating == Some(XMP_REJECTED_RATING) && metadata.flag.is_none() {
-        metadata.flag = Some(ImageFlag::Reject);
-        changed = true;
-    }
-
-    if metadata.rating == 0
-        && let Some(rating) = xmp_rating.and_then(|r| u8::try_from(r).ok())
-        && rating != 0
-    {
-        metadata.rating = rating;
-        if !metadata.adjustments.is_object() {
-            metadata.adjustments = default_adjustments();
-        }
-        if let Some(obj) = metadata.adjustments.as_object_mut() {
-            obj.insert("rating".to_string(), serde_json::json!(rating));
-        }
-        changed = true;
-    }
-
-    let mut current_tags = metadata.tags.clone().unwrap_or_default();
-    let original_len = current_tags.len();
-    let had_no_tags = metadata.tags.is_none();
-
-    let mut replaced = false;
-    for tag in &fields.subject {
-        for existing in current_tags.iter_mut() {
-            if existing != tag && unescape(existing).is_ok_and(|u| u == tag.as_str()) {
-                *existing = tag.clone();
-                replaced = true;
-            }
-        }
-    }
-    if replaced {
-        let mut seen = HashSet::new();
-        current_tags.retain(|t| seen.insert(t.clone()));
-    }
-
-    for tag in fields.subject {
-        if !current_tags.contains(&tag) {
-            current_tags.push(tag);
-        }
-    }
-
-    if let Some(label) = fields.label {
-        let label_tag = format!("{}{}", COLOR_TAG_PREFIX, label.to_lowercase());
-        if !current_tags.contains(&label_tag) {
-            current_tags.retain(|t| !t.starts_with(COLOR_TAG_PREFIX));
-            current_tags.push(label_tag);
-        }
-    }
-
-    if replaced || current_tags.len() != original_len || (had_no_tags && !current_tags.is_empty()) {
-        metadata.tags = Some(current_tags);
-        changed = true;
-    }
-    changed
 }
 
 const RAPIDRAW_COLORS: [&str; 5] = ["red", "yellow", "green", "blue", "purple"];
@@ -495,7 +430,6 @@ pub(crate) enum XmpWriteError {
     Unsupported(String),
     PrefixClash(String),
     Verify(String),
-    Io(std::io::Error),
 }
 
 impl std::fmt::Display for XmpWriteError {
@@ -505,7 +439,6 @@ impl std::fmt::Display for XmpWriteError {
             XmpWriteError::Unsupported(m) => write!(f, "unsupported shape: {}", m),
             XmpWriteError::PrefixClash(m) => write!(f, "namespace prefix clash: {}", m),
             XmpWriteError::Verify(m) => write!(f, "output check failed: {}", m),
-            XmpWriteError::Io(e) => write!(f, "io error: {}", e),
         }
     }
 }
@@ -1355,47 +1288,522 @@ pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Optio
     Ok(Some(out))
 }
 
-pub(crate) fn write_xmp_sidecar(
-    sidecar_path: &Path,
-    source_path: &Path,
-    values: &XmpValues,
-    create_if_missing: bool,
-) -> WriteResult<bool> {
-    if is_virtual_copy(sidecar_path, source_path) {
-        return Ok(false);
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct XmpSyncStateRaw {
+    rating: i8,
+    label: Option<String>,
+    keywords: Vec<String>,
+}
+
+impl From<XmpSyncStateRaw> for XmpSyncState {
+    fn from(raw: XmpSyncStateRaw) -> Self {
+        XmpSyncState::new(raw.rating, raw.label, raw.keywords)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(from = "XmpSyncStateRaw")]
+pub(crate) struct XmpSyncState {
+    pub rating: i8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct XmpSyncBase {
+    pub file: String,
+    pub state: XmpSyncState,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct XmpConflictInfo {
+    pub rr: XmpSyncState,
+    pub xmp: XmpSyncState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncAction {
+    InSync,
+    Import,
+    Write,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConflictChoice {
+    Import,
+    Write,
+}
+
+fn normalize_keyword(value: &str) -> &str {
+    let value = value.trim();
+    value.strip_prefix(USER_TAG_PREFIX).unwrap_or(value).trim()
+}
+
+pub(crate) fn normalize_keywords<S: AsRef<str>>(keywords: &[S]) -> Vec<String> {
+    let set: BTreeSet<String> = keywords
+        .iter()
+        .map(|k| normalize_keyword(k.as_ref()))
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+        .collect();
+    set.into_iter().collect()
+}
+
+impl XmpSyncState {
+    pub(crate) fn new(rating: i8, label: Option<String>, keywords: Vec<String>) -> Self {
+        XmpSyncState {
+            rating: if rating < 0 {
+                XMP_REJECTED_RATING
+            } else {
+                rating.min(5)
+            },
+            label: label.as_deref().and_then(normalize_label),
+            keywords: normalize_keywords(&keywords),
+        }
     }
 
-    let existing = resolve_xmp_path(source_path);
-    let (target, input, is_new) = match existing {
-        Some(path) => {
-            let content = fs::read_to_string(&path).map_err(XmpWriteError::Io)?;
-            (path, content, false)
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rating == 0 && self.label.is_none() && self.keywords.is_empty()
+    }
+
+    pub(crate) fn to_values(&self) -> XmpValues {
+        XmpValues {
+            rating: self.rating,
+            label: self.label.as_deref().map(|label| {
+                let mut chars = label.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            }),
+            keywords: self.keywords.clone(),
         }
-        None => {
-            if !create_if_missing {
-                return Ok(false);
+    }
+}
+
+pub(crate) fn rr_state(metadata: &ImageMetadata) -> XmpSyncState {
+    let values = XmpValues::from_metadata(metadata);
+    XmpSyncState::new(values.rating, values.label, values.keywords)
+}
+
+pub(crate) fn xmp_state(fields: &XmpFields, base: &XmpSyncState) -> XmpSyncState {
+    let rating = if fields.rating_invalid {
+        base.rating
+    } else {
+        fields.rating.unwrap_or(0)
+    };
+    XmpSyncState::new(rating, fields.label.clone(), fields.subject.clone())
+}
+
+pub(crate) fn classify(
+    base: Option<&XmpSyncState>,
+    rr: &XmpSyncState,
+    xmp: &XmpSyncState,
+) -> SyncAction {
+    if rr == xmp {
+        return SyncAction::InSync;
+    }
+    match base {
+        Some(base) if rr == base => SyncAction::Import,
+        Some(base) if xmp == base => SyncAction::Write,
+        Some(_) => SyncAction::Conflict,
+        None if rr.is_empty() => SyncAction::Import,
+        None if xmp.is_empty() => SyncAction::Write,
+        None => SyncAction::Conflict,
+    }
+}
+
+fn set_rating(metadata: &mut ImageMetadata, rating: u8) {
+    metadata.rating = rating;
+    if !metadata.adjustments.is_object() {
+        metadata.adjustments = default_adjustments();
+    }
+    if let Some(obj) = metadata.adjustments.as_object_mut() {
+        obj.insert("rating".to_string(), serde_json::json!(rating));
+    }
+}
+
+fn has_tag(tags: &[String], keyword: &str) -> bool {
+    tags.iter()
+        .any(|t| !t.starts_with(COLOR_TAG_PREFIX) && normalize_keyword(t) == keyword)
+}
+
+fn is_synced_keyword(name: &str) -> bool {
+    !name.is_empty() && valid_xml_text(name)
+}
+
+pub(crate) fn apply_state(
+    metadata: &mut ImageMetadata,
+    state: &XmpSyncState,
+    legacy_names: Option<&BTreeSet<String>>,
+) -> bool {
+    let before_rating = metadata.rating;
+    let before_flag = metadata.flag;
+    let before_tags = metadata.tags.clone();
+
+    if state.rating < 0 {
+        metadata.flag = Some(ImageFlag::Reject);
+    } else {
+        let rating = state.rating as u8;
+        if metadata.rating != rating {
+            set_rating(metadata, rating);
+        }
+        if metadata.flag == Some(ImageFlag::Reject) {
+            metadata.flag = None;
+        }
+    }
+
+    let original = metadata.tags.clone().unwrap_or_default();
+    let mut tags = original.clone();
+
+    let label_tag = state
+        .label
+        .as_ref()
+        .map(|label| format!("{}{}", COLOR_TAG_PREFIX, label));
+    let color_tags: Vec<&String> = tags
+        .iter()
+        .filter(|t| t.starts_with(COLOR_TAG_PREFIX))
+        .collect();
+    let label_ok = match &label_tag {
+        Some(label_tag) => color_tags.len() == 1 && color_tags[0] == label_tag,
+        None => color_tags.is_empty(),
+    };
+    if !label_ok {
+        tags.retain(|t| !t.starts_with(COLOR_TAG_PREFIX));
+        if let Some(label_tag) = label_tag {
+            tags.push(label_tag);
+        }
+    }
+
+    let wanted: BTreeSet<&str> = state.keywords.iter().map(String::as_str).collect();
+    tags.retain(|t| {
+        if t.starts_with(COLOR_TAG_PREFIX) {
+            return true;
+        }
+        let name = normalize_keyword(t);
+        !is_synced_keyword(name) || wanted.contains(name)
+    });
+    if let Some(legacy) = legacy_names {
+        for tag in tags.iter_mut() {
+            if tag.starts_with(COLOR_TAG_PREFIX) || tag.starts_with(USER_TAG_PREFIX) {
+                continue;
             }
-            (source_path.with_extension("xmp"), NEW_XMP.to_string(), true)
+            let name = normalize_keyword(tag);
+            if legacy.contains(name) {
+                *tag = format!("{}{}", USER_TAG_PREFIX, name);
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    tags.retain(|t| seen.insert(t.clone()));
+    for keyword in &state.keywords {
+        if !has_tag(&tags, keyword) {
+            tags.push(format!("{}{}", USER_TAG_PREFIX, keyword));
+        }
+    }
+
+    if tags != original {
+        metadata.tags = if tags.is_empty() { None } else { Some(tags) };
+    }
+
+    metadata.rating != before_rating || metadata.flag != before_flag || metadata.tags != before_tags
+}
+
+fn decode_legacy_tags(metadata: &mut ImageMetadata, subject: &[String]) -> bool {
+    let Some(tags) = metadata.tags.as_mut() else {
+        return false;
+    };
+    let mut replaced = false;
+    for tag in tags.iter_mut() {
+        if tag.starts_with(COLOR_TAG_PREFIX) || !tag.contains('&') {
+            continue;
+        }
+        let prefix = if tag.trim().starts_with(USER_TAG_PREFIX) {
+            USER_TAG_PREFIX
+        } else {
+            ""
+        };
+        let name = normalize_keyword(tag);
+        let decoded = match unescape(name) {
+            Ok(decoded) if decoded != name && subject.iter().any(|s| s.trim() == decoded) => {
+                format!("{}{}", prefix, decoded)
+            }
+            _ => continue,
+        };
+        *tag = decoded;
+        replaced = true;
+    }
+    if replaced {
+        let mut seen = HashSet::new();
+        tags.retain(|t| seen.insert(t.clone()));
+    }
+    replaced
+}
+
+fn sidecar_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn matching_base(metadata: &ImageMetadata, file: &str) -> Option<XmpSyncState> {
+    metadata
+        .xmp_sync
+        .as_ref()
+        .filter(|base| base.file.to_lowercase() == file.to_lowercase())
+        .map(|base| base.state.clone())
+}
+
+fn set_base(metadata: &mut ImageMetadata, file: &str, state: &XmpSyncState) {
+    metadata.xmp_sync = (!state.is_empty()).then(|| XmpSyncBase {
+        file: file.to_string(),
+        state: state.clone(),
+    });
+}
+
+fn legacy_names(state: &XmpSyncState) -> BTreeSet<String> {
+    state.keywords.iter().cloned().collect()
+}
+
+fn snapshot(
+    metadata: &ImageMetadata,
+) -> (
+    u8,
+    Option<ImageFlag>,
+    Option<Vec<String>>,
+    Option<XmpSyncBase>,
+    bool,
+) {
+    (
+        metadata.rating,
+        metadata.flag,
+        metadata.tags.clone(),
+        metadata.xmp_sync.clone(),
+        metadata.xmp_conflict,
+    )
+}
+
+fn import_state(metadata: &mut ImageMetadata, state: &XmpSyncState, first_sync: bool) -> bool {
+    let legacy = first_sync.then(|| legacy_names(state));
+    apply_state(metadata, state, legacy.as_ref())
+}
+
+struct ReadSidecar {
+    path: PathBuf,
+    file: String,
+    content: String,
+    base: Option<XmpSyncState>,
+    xmp: XmpSyncState,
+}
+
+impl ReadSidecar {
+    fn new(path: PathBuf, content: String, fields: &XmpFields, metadata: &ImageMetadata) -> Self {
+        let file = sidecar_file_name(&path);
+        let base = matching_base(metadata, &file);
+        let xmp = xmp_state(fields, &base.clone().unwrap_or_default());
+        ReadSidecar {
+            path,
+            file,
+            content,
+            base,
+            xmp,
+        }
+    }
+}
+
+fn read_sidecar(path: PathBuf, metadata: &mut ImageMetadata) -> Result<ReadSidecar, String> {
+    let content = fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+    let fields =
+        parse_xmp(&content).map_err(|e| format!("failed to parse {}: {}", path.display(), e))?;
+    decode_legacy_tags(metadata, &fields.subject);
+    Ok(ReadSidecar::new(path, content, &fields, metadata))
+}
+
+fn sync_action(
+    metadata: &ImageMetadata,
+    base: Option<&XmpSyncState>,
+    rr: &XmpSyncState,
+    xmp: &XmpSyncState,
+) -> SyncAction {
+    match classify(base, rr, xmp) {
+        SyncAction::Import | SyncAction::Write if metadata.xmp_conflict => SyncAction::Conflict,
+        action => action,
+    }
+}
+
+pub(crate) fn sync_on_load(source_path: &Path, metadata: &mut ImageMetadata) -> bool {
+    let before = snapshot(metadata);
+    let Some(path) = resolve_xmp_path(source_path) else {
+        metadata.xmp_conflict = false;
+        return snapshot(metadata) != before;
+    };
+    let side = match read_xmp_file(&path) {
+        Ok(fields) => {
+            decode_legacy_tags(metadata, &fields.subject);
+            ReadSidecar::new(path, String::new(), &fields, metadata)
+        }
+        Err(e) => {
+            log::warn!("Skipping XMP sync: {}", e);
+            return false;
         }
     };
 
-    let out = update_xmp(&input, values)?;
-    if out.is_none() && !is_new {
-        return Ok(false);
+    let rr = rr_state(metadata);
+    let first_sync = side.base.is_none();
+    match sync_action(metadata, side.base.as_ref(), &rr, &side.xmp) {
+        SyncAction::InSync => {
+            if first_sync {
+                import_state(metadata, &side.xmp, true);
+            }
+            set_base(metadata, &side.file, &side.xmp);
+            metadata.xmp_conflict = false;
+        }
+        SyncAction::Import => {
+            import_state(metadata, &side.xmp, first_sync);
+            set_base(metadata, &side.file, &side.xmp);
+            metadata.xmp_conflict = false;
+            log::info!("Imported XMP values from {}", side.path.display());
+        }
+        SyncAction::Write => {
+            metadata.xmp_conflict = false;
+        }
+        SyncAction::Conflict => {
+            if !metadata.xmp_conflict {
+                log::info!("XMP conflict for {}", source_path.display());
+            }
+            metadata.xmp_conflict = true;
+        }
     }
-    let bytes = out.unwrap_or(input);
-    write_atomic(&target, bytes.as_bytes()).map_err(XmpWriteError::Io)?;
-    Ok(true)
+    snapshot(metadata) != before
 }
 
-pub fn sync_metadata_to_xmp(
-    sidecar_path: &Path,
+pub(crate) fn sync_on_save(
+    source_path: &Path,
+    metadata: &mut ImageMetadata,
+    create_if_missing: bool,
+) -> bool {
+    let Some(path) = resolve_xmp_path(source_path) else {
+        if !create_if_missing {
+            return false;
+        }
+        let rr = rr_state(metadata);
+        let target = source_path.with_extension("xmp");
+        let out = match update_xmp(NEW_XMP, &rr.to_values()) {
+            Ok(out) => out.unwrap_or_else(|| NEW_XMP.to_string()),
+            Err(e) => {
+                log::warn!("Not writing XMP for {}: {}", source_path.display(), e);
+                return false;
+            }
+        };
+        if let Err(e) = write_atomic(&target, out.as_bytes()) {
+            log::warn!("Not writing XMP for {}: {}", source_path.display(), e);
+            return false;
+        }
+        set_base(metadata, &sidecar_file_name(&target), &rr);
+        metadata.xmp_conflict = false;
+        return false;
+    };
+    let tags_before = metadata.tags.clone();
+    let side = match read_sidecar(path, metadata) {
+        Ok(side) => side,
+        Err(e) => {
+            log::warn!("Not writing XMP for {}: {}", source_path.display(), e);
+            return false;
+        }
+    };
+    let decoded = metadata.tags != tags_before;
+
+    let rr = rr_state(metadata);
+    let first_sync = side.base.is_none();
+    let imported = match sync_action(metadata, side.base.as_ref(), &rr, &side.xmp) {
+        SyncAction::Conflict => {
+            if !metadata.xmp_conflict {
+                log::info!("XMP conflict for {}", source_path.display());
+            }
+            metadata.xmp_conflict = true;
+            false
+        }
+        SyncAction::Import => {
+            let changed = import_state(metadata, &side.xmp, first_sync);
+            set_base(metadata, &side.file, &side.xmp);
+            metadata.xmp_conflict = false;
+            log::info!("Imported XMP values from {}", side.path.display());
+            changed
+        }
+        SyncAction::InSync => {
+            let changed = first_sync && import_state(metadata, &side.xmp, true);
+            set_base(metadata, &side.file, &side.xmp);
+            metadata.xmp_conflict = false;
+            changed
+        }
+        SyncAction::Write => {
+            let written = match update_xmp(&side.content, &rr.to_values()) {
+                Ok(None) => Ok(()),
+                Ok(Some(out)) => {
+                    write_atomic(&side.path, out.as_bytes()).map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            match written {
+                Ok(()) => {
+                    set_base(metadata, &side.file, &rr);
+                    metadata.xmp_conflict = false;
+                }
+                Err(e) => log::warn!("Not writing XMP for {}: {}", source_path.display(), e),
+            }
+            false
+        }
+    };
+    imported || decoded
+}
+
+pub(crate) fn resolve_xmp_conflict(
+    source_path: &Path,
+    metadata: &mut ImageMetadata,
+    choice: ConflictChoice,
+) -> Result<(), String> {
+    let path = resolve_xmp_path(source_path)
+        .ok_or_else(|| format!("no XMP sidecar for {}", source_path.display()))?;
+    let side = read_sidecar(path, metadata)?;
+    match choice {
+        ConflictChoice::Import => {
+            import_state(metadata, &side.xmp, side.base.is_none());
+            set_base(metadata, &side.file, &side.xmp);
+        }
+        ConflictChoice::Write => {
+            let rr = rr_state(metadata);
+            if let Some(out) = update_xmp(&side.content, &rr.to_values())
+                .map_err(|e| format!("cannot write {}: {}", side.path.display(), e))?
+            {
+                write_atomic(&side.path, out.as_bytes())
+                    .map_err(|e| format!("cannot write {}: {}", side.path.display(), e))?;
+            }
+            set_base(metadata, &side.file, &rr);
+        }
+    }
+    metadata.xmp_conflict = false;
+    Ok(())
+}
+
+pub(crate) fn xmp_conflict_info(
     source_path: &Path,
     metadata: &ImageMetadata,
-    create_if_missing: bool,
-) {
-    let values = XmpValues::from_metadata(metadata);
-    if let Err(e) = write_xmp_sidecar(sidecar_path, source_path, &values, create_if_missing) {
-        log::warn!("Not writing XMP for {}: {}", source_path.display(), e);
+) -> Result<Option<XmpConflictInfo>, String> {
+    if !metadata.xmp_conflict {
+        return Ok(None);
     }
+    let Some(path) = resolve_xmp_path(source_path) else {
+        return Ok(None);
+    };
+    let mut metadata = metadata.clone();
+    let side = read_sidecar(path, &mut metadata)?;
+    Ok(Some(XmpConflictInfo {
+        rr: rr_state(&metadata),
+        xmp: side.xmp,
+    }))
 }

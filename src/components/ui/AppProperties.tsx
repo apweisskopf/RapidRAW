@@ -71,6 +71,7 @@ export enum Invokes {
   GetOrCreateInternalLibraryRoot = 'get_or_create_internal_library_root',
   GetPinnedFolderTrees = 'get_pinned_folder_trees',
   GetSupportedFileTypes = 'get_supported_file_types',
+  GetXmpConflict = 'get_xmp_conflict',
   HandleExportPresetsToFile = 'handle_export_presets_to_file',
   HandleImportPresetsFromFile = 'handle_import_presets_from_file',
   HandleImportPresetsFromFiles = 'handle_import_presets_from_files',
@@ -124,6 +125,8 @@ export enum Invokes {
   TetherSetSetting = 'tether_set_setting',
   TetherCapture = 'tether_capture',
   TetherGetPreview = 'tether_get_preview',
+  XmpConflictImport = 'xmp_conflict_import',
+  XmpConflictWrite = 'xmp_conflict_write',
 }
 
 export enum ExifOverlay {
@@ -358,6 +361,7 @@ export interface ImageFile {
   is_cloud_placeholder: boolean;
   is_raw: boolean;
   group_id: string | null;
+  xmp_conflict?: boolean;
 }
 
 export interface Option {
