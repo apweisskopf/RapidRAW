@@ -1,17 +1,17 @@
 use std::collections::HashSet;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use quick_xml::XmlVersion;
-use quick_xml::escape::{escape, partial_escape, unescape};
+use quick_xml::escape::{escape, unescape};
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::name::{NamespaceResolver, ResolveResult};
+use quick_xml::name::{NamespaceResolver, PrefixDeclaration, ResolveResult};
 use quick_xml::reader::NsReader;
-use regex::{NoExpand, regex};
 
 use crate::file_management::{is_virtual_copy, write_atomic};
 use crate::image_processing::{ImageFlag, ImageMetadata, default_adjustments};
-use crate::tagging::COLOR_TAG_PREFIX;
+use crate::tagging::{COLOR_TAG_PREFIX, USER_TAG_PREFIX};
 
 const NS_RDF: &[u8] = b"http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const NS_XMP: &[u8] = b"http://ns.adobe.com/xap/1.0/";
@@ -414,33 +414,12 @@ pub fn sync_metadata_from_xmp(source_path: &Path, metadata: &mut ImageMetadata) 
     changed
 }
 
-pub fn sync_metadata_to_xmp(
-    sidecar_path: &Path,
-    source_path: &Path,
-    metadata: &ImageMetadata,
-    create_if_missing: bool,
-) {
-    if is_virtual_copy(sidecar_path, source_path) {
-        return;
-    }
+const RAPIDRAW_COLORS: [&str; 5] = ["red", "yellow", "green", "blue", "purple"];
 
-    let xmp_path = source_path.with_extension("xmp");
-    let xmp_path_upper = source_path.with_extension("XMP");
+const NS_XMP_STR: &str = "http://ns.adobe.com/xap/1.0/";
+const NS_DC_STR: &str = "http://purl.org/dc/elements/1.1/";
 
-    let mut actual_xmp = if xmp_path.exists() {
-        Some(xmp_path.clone())
-    } else if xmp_path_upper.exists() {
-        Some(xmp_path_upper.clone())
-    } else {
-        None
-    };
-
-    let mut new_content: Option<String> = None;
-    if actual_xmp.is_none() {
-        if !create_if_missing {
-            return;
-        }
-        let skeleton = r#"<?xml version="1.0" encoding="UTF-8"?>
+const NEW_XMP: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="RapidRAW">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
   <rdf:Description rdf:about=""
@@ -449,110 +428,974 @@ pub fn sync_metadata_to_xmp(
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>"#;
-        new_content = Some(skeleton.to_string());
-        actual_xmp = Some(xmp_path);
+
+pub(crate) fn normalize_label(value: &str) -> Option<String> {
+    let label = value.trim().to_lowercase();
+    RAPIDRAW_COLORS.contains(&label.as_str()).then_some(label)
+}
+
+fn valid_xml_text(value: &str) -> bool {
+    value.chars().all(|c| {
+        (c >= ' ' || matches!(c, '\t' | '\n' | '\r')) && c != '\u{fffe}' && c != '\u{ffff}'
+    })
+}
+
+pub(crate) struct XmpValues {
+    pub rating: i8,
+    pub label: Option<String>,
+    pub keywords: Vec<String>,
+}
+
+impl XmpValues {
+    pub(crate) fn from_metadata(metadata: &ImageMetadata) -> Self {
+        let tags = metadata.tags.clone().unwrap_or_default();
+        let label = xmp_label(&tags).filter(|label| {
+            if label.trim().is_empty() {
+                return false;
+            }
+            let valid = valid_xml_text(label);
+            if !valid {
+                log::warn!("Dropping XMP label with characters invalid in XML");
+            }
+            valid
+        });
+        XmpValues {
+            rating: xmp_rating(metadata).parse().unwrap_or(0),
+            label,
+            keywords: xmp_keywords(&tags),
+        }
+    }
+}
+
+pub(crate) fn xmp_keywords(tags: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut keywords = Vec::new();
+    for tag in tags {
+        if tag.starts_with(COLOR_TAG_PREFIX) {
+            continue;
+        }
+        let keyword = tag.strip_prefix(USER_TAG_PREFIX).unwrap_or(tag).trim();
+        if keyword.is_empty() {
+            continue;
+        }
+        if !valid_xml_text(keyword) {
+            log::warn!("Dropping XMP keyword with characters invalid in XML");
+            continue;
+        }
+        if seen.insert(keyword.to_string()) {
+            keywords.push(keyword.to_string());
+        }
+    }
+    keywords
+}
+
+#[derive(Debug)]
+pub(crate) enum XmpWriteError {
+    Parse(String),
+    Unsupported(String),
+    PrefixClash(String),
+    Verify(String),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for XmpWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            XmpWriteError::Parse(m) => write!(f, "cannot parse: {}", m),
+            XmpWriteError::Unsupported(m) => write!(f, "unsupported shape: {}", m),
+            XmpWriteError::PrefixClash(m) => write!(f, "namespace prefix clash: {}", m),
+            XmpWriteError::Verify(m) => write!(f, "output check failed: {}", m),
+            XmpWriteError::Io(e) => write!(f, "io error: {}", e),
+        }
+    }
+}
+
+type WriteResult<T> = Result<T, XmpWriteError>;
+
+fn parse_err<E: std::fmt::Display>(e: E) -> XmpWriteError {
+    XmpWriteError::Parse(e.to_string())
+}
+
+fn unsupported(msg: &str) -> XmpWriteError {
+    XmpWriteError::Unsupported(msg.to_string())
+}
+
+struct AttrLoc {
+    whole: Range<usize>,
+    value: Range<usize>,
+}
+
+enum ElemBody {
+    Content(Range<usize>),
+    EmptyEnd(Range<usize>),
+}
+
+struct ElemLoc {
+    whole: Range<usize>,
+    body: ElemBody,
+    qname: String,
+}
+
+enum Loc {
+    Attr(AttrLoc),
+    Elem(ElemLoc),
+}
+
+struct Occ {
+    loc: Loc,
+    decoded: String,
+}
+
+struct SubjectOcc {
+    elem: ElemLoc,
+    values: Vec<String>,
+    desc: usize,
+}
+
+#[derive(Default)]
+struct DescInfo {
+    tag_end: usize,
+    attrs_end: usize,
+    self_closing: bool,
+    end_tag: Option<Range<usize>>,
+    qname: String,
+    multiline: bool,
+    indent: Option<String>,
+    attr_indent: Option<String>,
+    child_indent: Option<String>,
+    quote: u8,
+    rdf: Option<String>,
+    xmp: Option<String>,
+    dc: Option<String>,
+    xmp_clash: bool,
+    dc_clash: bool,
+}
+
+#[derive(Default)]
+struct RdfInfo {
+    prefix: Option<String>,
+    end_tag: Option<Range<usize>>,
+}
+
+#[derive(Default)]
+struct Scan {
+    descs: Vec<DescInfo>,
+    ratings: Vec<Occ>,
+    labels: Vec<Occ>,
+    subjects: Vec<SubjectOcc>,
+    rdf: Option<RdfInfo>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Meta,
+    Rdf,
+    Desc,
+    Rating,
+    Label,
+    Subject,
+    Container,
+    Li,
+    Other,
+}
+
+fn offset(content: &str, slice: &[u8]) -> WriteResult<usize> {
+    let base = content.as_ptr() as usize;
+    let start = slice.as_ptr() as usize;
+    if start < base || start + slice.len() > base + content.len() {
+        return Err(parse_err("slice does not borrow from the input"));
+    }
+    Ok(start - base)
+}
+
+fn line_indent(content: &str, pos: usize) -> Option<String> {
+    let bytes = content.as_bytes();
+    let mut i = pos;
+    while i > 0 && matches!(bytes[i - 1], b' ' | b'\t') {
+        i -= 1;
+    }
+    if i == 0 || bytes[i - 1] == b'\n' {
+        Some(content[i..pos].to_string())
+    } else {
+        None
+    }
+}
+
+fn find_gt(content: &str, from: usize) -> WriteResult<usize> {
+    content[from..]
+        .find('>')
+        .map(|p| from + p + 1)
+        .ok_or_else(|| parse_err("unterminated tag"))
+}
+
+fn utf8(bytes: &[u8]) -> WriteResult<&str> {
+    std::str::from_utf8(bytes).map_err(parse_err)
+}
+
+fn normalize_values<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if !value.is_empty() && seen.insert(value.to_string()) {
+            out.push(value.to_string());
+        }
+    }
+    out
+}
+
+struct Cursor {
+    start: usize,
+    tag_end: usize,
+    qname: String,
+    desc: usize,
+    text: String,
+    values: Vec<String>,
+}
+
+struct Scanner<'a> {
+    content: &'a str,
+    scan: Scan,
+    stack: Vec<Kind>,
+    cur: Option<Cursor>,
+}
+
+impl<'a> Scanner<'a> {
+    fn open(
+        &mut self,
+        resolver: &NamespaceResolver,
+        ns: &Ns,
+        e: &BytesStart<'a>,
+        empty: bool,
+    ) -> WriteResult<()> {
+        let content = self.content;
+        let name_start = offset(content, e.name().as_ref())?;
+        let name_end = name_start + e.name().as_ref().len();
+        let tag_start = name_start - 1;
+        let qname = utf8(e.name().as_ref())?.to_string();
+        let local_name = e.local_name();
+        let local = local_name.as_ref();
+
+        let kind = match self.stack.last().copied() {
+            None => {
+                if is_name(ns, NS_RDF, local, &[b"RDF"]) {
+                    Kind::Rdf
+                } else {
+                    Kind::Meta
+                }
+            }
+            Some(Kind::Meta) => {
+                if is_name(ns, NS_RDF, local, &[b"RDF"]) {
+                    Kind::Rdf
+                } else {
+                    Kind::Other
+                }
+            }
+            Some(Kind::Rdf) => {
+                if is_name(ns, NS_RDF, local, &[b"Description"]) {
+                    Kind::Desc
+                } else {
+                    Kind::Other
+                }
+            }
+            Some(Kind::Desc) => {
+                if is_name(ns, NS_XMP, local, &[b"Rating"]) {
+                    Kind::Rating
+                } else if is_name(ns, NS_XMP, local, &[b"Label"]) {
+                    Kind::Label
+                } else if is_name(ns, NS_DC, local, &[b"subject"]) {
+                    Kind::Subject
+                } else {
+                    Kind::Other
+                }
+            }
+            Some(Kind::Subject) => Kind::Container,
+            Some(Kind::Container) => Kind::Li,
+            Some(Kind::Rating | Kind::Label | Kind::Li) => {
+                return Err(unsupported("child element in a text property"));
+            }
+            Some(Kind::Other) => Kind::Other,
+        };
+
+        if self.stack.last() == Some(&Kind::Desc) && self.scan_child_indent_missing() {
+            let indent = line_indent(content, tag_start);
+            if let Some(desc) = self.scan.descs.last_mut() {
+                desc.child_indent = indent;
+            }
+        }
+
+        match kind {
+            Kind::Rdf => {
+                if empty {
+                    return Err(unsupported("self-closing rdf:RDF"));
+                }
+                if self.scan.rdf.is_none() {
+                    let prefix = qname.split_once(':').map(|(p, _)| p.to_string());
+                    self.scan.rdf = Some(RdfInfo {
+                        prefix,
+                        end_tag: None,
+                    });
+                }
+            }
+            Kind::Desc => self.open_desc(resolver, e, tag_start, name_end, qname, empty)?,
+            Kind::Rating | Kind::Label | Kind::Subject => {
+                let attrs_end = self.attrs_end(e, name_end)?;
+                let tag_end = find_gt(content, attrs_end)?;
+                self.cur = Some(Cursor {
+                    start: tag_start,
+                    tag_end,
+                    qname,
+                    desc: self.scan.descs.len().saturating_sub(1),
+                    text: String::new(),
+                    values: Vec::new(),
+                });
+            }
+            Kind::Li => {
+                if let Some(cur) = self.cur.as_mut() {
+                    cur.text.clear();
+                }
+            }
+            _ => {}
+        }
+
+        self.stack.push(kind);
+        Ok(())
     }
 
-    if let Some(xmp_file) = actual_xmp {
-        let file_existed = new_content.is_none();
-        let original = match new_content {
-            Some(skeleton) => skeleton,
-            None => match fs::read_to_string(&xmp_file) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("Failed to read XMP {}: {}", xmp_file.display(), e);
-                    return;
+    fn scan_child_indent_missing(&self) -> bool {
+        self.scan
+            .descs
+            .last()
+            .is_some_and(|d| d.child_indent.is_none())
+    }
+
+    fn attrs_end(&self, e: &BytesStart<'a>, name_end: usize) -> WriteResult<usize> {
+        let mut end = name_end;
+        for attr in e.attributes() {
+            let attr = attr.map_err(parse_err)?;
+            let value = offset(self.content, &attr.value)?;
+            end = value + attr.value.len() + 1;
+        }
+        Ok(end)
+    }
+
+    fn open_desc(
+        &mut self,
+        resolver: &NamespaceResolver,
+        e: &BytesStart<'a>,
+        tag_start: usize,
+        name_end: usize,
+        qname: String,
+        empty: bool,
+    ) -> WriteResult<()> {
+        let content = self.content;
+        let mut desc = DescInfo {
+            self_closing: empty,
+            qname,
+            quote: b'"',
+            indent: line_indent(content, tag_start),
+            ..DescInfo::default()
+        };
+
+        let mut attrs_end = name_end;
+        for attr in e.attributes() {
+            let attr = attr.map_err(parse_err)?;
+            let key_start = offset(content, attr.key.as_ref())?;
+            let value_start = offset(content, &attr.value)?;
+            let value_end = value_start + attr.value.len();
+            desc.quote = content.as_bytes()[value_start - 1];
+            if let Some(indent) = line_indent(content, key_start) {
+                desc.attr_indent = Some(indent);
+            }
+            attrs_end = value_end + 1;
+
+            let key = attr.key.as_ref();
+            if key == b"xmlns" || key.starts_with(b"xmlns:") {
+                continue;
+            }
+            let (res, local) = resolver.resolve_attribute(attr.key);
+            let attr_ns = bound(res).map_err(parse_err)?;
+            let decoded = unescape(utf8(&attr.value)?).map_err(parse_err)?;
+            let occ = Occ {
+                loc: Loc::Attr(AttrLoc {
+                    whole: key_start..value_end + 1,
+                    value: value_start..value_end,
+                }),
+                decoded: decoded.trim().to_string(),
+            };
+            if is_name(&attr_ns, NS_XMP, local.as_ref(), &[b"Rating"]) {
+                self.scan.ratings.push(occ);
+            } else if is_name(&attr_ns, NS_XMP, local.as_ref(), &[b"Label"]) {
+                self.scan.labels.push(occ);
+            }
+        }
+
+        desc.attrs_end = attrs_end;
+        desc.tag_end = find_gt(content, attrs_end)?;
+        desc.multiline = content[tag_start..desc.tag_end].contains('\n');
+
+        for (decl, namespace) in resolver.bindings() {
+            let PrefixDeclaration::Named(prefix) = decl else {
+                continue;
+            };
+            let prefix = utf8(prefix)?.to_string();
+            let uri = namespace.into_inner();
+            if uri == NS_RDF && desc.rdf.is_none() {
+                desc.rdf = Some(prefix.clone());
+            }
+            if uri == NS_XMP && desc.xmp.is_none() {
+                desc.xmp = Some(prefix.clone());
+            }
+            if uri == NS_DC && desc.dc.is_none() {
+                desc.dc = Some(prefix.clone());
+            }
+            if prefix == "xmp" && uri != NS_XMP {
+                desc.xmp_clash = true;
+            }
+            if prefix == "dc" && uri != NS_DC {
+                desc.dc_clash = true;
+            }
+        }
+
+        self.scan.descs.push(desc);
+        Ok(())
+    }
+
+    fn close(
+        &mut self,
+        end: Option<(usize, usize)>,
+        empty_end: Option<Range<usize>>,
+    ) -> WriteResult<()> {
+        let kind = self
+            .stack
+            .pop()
+            .ok_or_else(|| parse_err("unexpected end tag"))?;
+        match kind {
+            Kind::Rdf => {
+                if let (Some((start, stop)), Some(rdf)) = (end, self.scan.rdf.as_mut())
+                    && rdf.end_tag.is_none()
+                {
+                    rdf.end_tag = Some(start..stop);
+                }
+            }
+            Kind::Desc => {
+                if let (Some((start, stop)), Some(desc)) = (end, self.scan.descs.last_mut()) {
+                    desc.end_tag = Some(start..stop);
+                }
+            }
+            Kind::Li => {
+                if let Some(cur) = self.cur.as_mut() {
+                    let raw = std::mem::take(&mut cur.text);
+                    let decoded = unescape(&raw).map_err(parse_err)?;
+                    cur.values.push(decoded.to_string());
+                }
+            }
+            Kind::Rating | Kind::Label | Kind::Subject => {
+                let cur = self
+                    .cur
+                    .take()
+                    .ok_or_else(|| parse_err("property without cursor"))?;
+                let (whole, body) = match (end, empty_end) {
+                    (Some((start, stop)), _) => {
+                        (cur.start..stop, ElemBody::Content(cur.tag_end..start))
+                    }
+                    (None, Some(range)) => (cur.start..range.end, ElemBody::EmptyEnd(range)),
+                    (None, None) => return Err(parse_err("property without end")),
+                };
+                let elem = ElemLoc {
+                    whole,
+                    body,
+                    qname: cur.qname,
+                };
+                match kind {
+                    Kind::Subject => self.scan.subjects.push(SubjectOcc {
+                        elem,
+                        values: normalize_values(cur.values.iter().map(String::as_str)),
+                        desc: cur.desc,
+                    }),
+                    _ => {
+                        let raw = unescape(&cur.text).map_err(parse_err)?;
+                        let occ = Occ {
+                            loc: Loc::Elem(elem),
+                            decoded: raw.trim().to_string(),
+                        };
+                        if kind == Kind::Rating {
+                            self.scan.ratings.push(occ);
+                        } else {
+                            self.scan.labels.push(occ);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if matches!(
+            self.stack.last(),
+            Some(Kind::Rating | Kind::Label | Kind::Li)
+        ) && let Some(cur) = self.cur.as_mut()
+        {
+            cur.text.push_str(text);
+        }
+    }
+}
+
+fn scan_xmp(content: &str) -> WriteResult<Scan> {
+    let mut reader = NsReader::from_str(content);
+    let mut scanner = Scanner {
+        content,
+        scan: Scan::default(),
+        stack: Vec::new(),
+        cur: None,
+    };
+
+    loop {
+        let (res, event) = reader.read_resolved_event().map_err(parse_err)?;
+        let ns = bound(res).map_err(parse_err)?;
+        if matches!(scanner.stack.last(), Some(Kind::Rating | Kind::Label))
+            && matches!(event, Event::Comment(_) | Event::PI(_) | Event::DocType(_))
+        {
+            return Err(unsupported("markup inside xmp:Rating or xmp:Label"));
+        }
+        match event {
+            Event::Decl(d) => {
+                if let Some(enc) = d.encoding() {
+                    let enc = enc.map_err(parse_err)?;
+                    if !enc.eq_ignore_ascii_case(b"utf-8") {
+                        return Err(unsupported("encoding other than UTF-8"));
+                    }
+                }
+            }
+            Event::Start(e) => scanner.open(reader.resolver(), &ns, &e, false)?,
+            Event::Empty(e) => {
+                scanner.open(reader.resolver(), &ns, &e, true)?;
+                let name_end = offset(content, e.name().as_ref())? + e.name().as_ref().len();
+                let attrs_end = scanner.attrs_end(&e, name_end)?;
+                let tag_end = find_gt(content, attrs_end)?;
+                scanner.close(None, Some(attrs_end..tag_end))?;
+            }
+            Event::End(e) => {
+                let name_start = offset(content, e.name().as_ref())?;
+                let end = find_gt(content, name_start + e.name().as_ref().len())?;
+                scanner.close(Some((name_start - 2, end)), None)?;
+            }
+            Event::Text(t) => scanner.push_text(&t.decode().map_err(parse_err)?),
+            Event::CData(t) => {
+                let decoded = t.decode().map_err(parse_err)?;
+                scanner.push_text(&escape(decoded));
+            }
+            Event::GeneralRef(r) => {
+                let name = r.decode().map_err(parse_err)?;
+                scanner.push_text(&format!("&{};", name));
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(scanner.scan)
+}
+
+struct Edit {
+    range: Range<usize>,
+    text: String,
+}
+
+struct Editor<'a> {
+    content: &'a str,
+    edits: Vec<Edit>,
+}
+
+impl Editor<'_> {
+    fn replace(&mut self, range: Range<usize>, text: String) {
+        self.edits.push(Edit { range, text });
+    }
+
+    fn set_value(&mut self, loc: &Loc, text: &str) {
+        match loc {
+            Loc::Attr(a) => self.replace(a.value.clone(), text.to_string()),
+            Loc::Elem(el) => match &el.body {
+                ElemBody::Content(range) => self.replace(range.clone(), text.to_string()),
+                ElemBody::EmptyEnd(range) => {
+                    self.replace(range.clone(), format!(">{}</{}>", text, el.qname))
                 }
             },
-        };
-        if file_existed && let Err(e) = parse_xmp(&original) {
-            log::warn!("Not touching XMP {}: {}", xmp_file.display(), e);
-            return;
         }
-        let mut content = original.clone();
-        let rating_str = xmp_rating(metadata);
-        let re_rating_attr = regex!(r#"xmp:Rating\s*=\s*"[^"]*""#);
-        let re_rating_tag = regex!(r#"<xmp:Rating\s*>[^<]*</xmp:Rating>"#);
+    }
 
-        if re_rating_attr.is_match(&content) {
-            let replacement = format!("xmp:Rating=\"{}\"", rating_str);
-            content = re_rating_attr
-                .replace(&content, NoExpand(&replacement))
-                .to_string();
-        } else if re_rating_tag.is_match(&content) {
-            let replacement = format!("<xmp:Rating>{}</xmp:Rating>", rating_str);
-            content = re_rating_tag
-                .replace(&content, NoExpand(&replacement))
-                .to_string();
-        } else if let Some(last_index) = content.rfind("</rdf:Description>") {
-            let (start, end) = content.split_at(last_index);
-            content = format!("{} <xmp:Rating>{}</xmp:Rating>\n{}", start, rating_str, end);
+    fn remove(&mut self, range: Range<usize>) {
+        let bytes = self.content.as_bytes();
+        let mut start = range.start;
+        while start > 0 && matches!(bytes[start - 1], b' ' | b'\t') {
+            start -= 1;
         }
+        if start > 0 && bytes[start - 1] == b'\n' {
+            start -= 1;
+            if start > 0 && bytes[start - 1] == b'\r' {
+                start -= 1;
+            }
+        }
+        self.edits.push(Edit {
+            range: start..range.end,
+            text: String::new(),
+        });
+    }
 
-        let current_tags = metadata.tags.clone().unwrap_or_default();
-        let label = xmp_label(&current_tags);
-        let normal_tags: Vec<String> = current_tags
-            .into_iter()
-            .filter(|t| !t.starts_with(COLOR_TAG_PREFIX))
-            .collect();
+    fn apply(mut self) -> WriteResult<String> {
+        self.edits.sort_by_key(|e| (e.range.start, e.range.end));
+        for pair in self.edits.windows(2) {
+            if pair[0].range.end > pair[1].range.start {
+                return Err(XmpWriteError::Verify("overlapping edits".to_string()));
+            }
+        }
+        let mut out = self.content.to_string();
+        for edit in self.edits.iter().rev() {
+            out.replace_range(edit.range.clone(), &edit.text);
+        }
+        Ok(out)
+    }
+}
 
-        if let Some(lbl) = label {
-            let re_label_attr = regex!(r#"xmp:Label\s*=\s*"[^"]*""#);
-            let re_label_tag = regex!(r#"<xmp:Label\s*>[^<]*</xmp:Label>"#);
+fn render_subject(qname: &str, rdf: &str, items: &[String], indent: &str, nl: &str) -> String {
+    let mut out = format!("<{}>{}{} <{}:Bag>{}", qname, nl, indent, rdf, nl);
+    for item in items {
+        out.push_str(&format!(
+            "{}  <{}:li>{}</{}:li>{}",
+            indent,
+            rdf,
+            escape(item.as_str()),
+            rdf,
+            nl
+        ));
+    }
+    out.push_str(&format!(
+        "{} </{}:Bag>{}{}</{}>",
+        indent, rdf, nl, indent, qname
+    ));
+    out
+}
 
-            if re_label_attr.is_match(&content) {
-                let replacement = format!("xmp:Label=\"{}\"", escape(lbl.as_str()));
-                content = re_label_attr
-                    .replace(&content, NoExpand(&replacement))
-                    .to_string();
-            } else if re_label_tag.is_match(&content) {
-                let replacement =
-                    format!("<xmp:Label>{}</xmp:Label>", partial_escape(lbl.as_str()));
-                content = re_label_tag
-                    .replace(&content, NoExpand(&replacement))
-                    .to_string();
-            } else if let Some(last_index) = content.rfind("</rdf:Description>") {
-                let (start, end) = content.split_at(last_index);
-                content = format!(
-                    "{} <xmp:Label>{}</xmp:Label>\n{}",
-                    start,
-                    partial_escape(lbl.as_str()),
-                    end
+fn same_set(a: &[String], b: &[String]) -> bool {
+    let a: HashSet<&String> = a.iter().collect();
+    let b: HashSet<&String> = b.iter().collect();
+    a == b
+}
+
+pub(crate) fn update_xmp(content: &str, values: &XmpValues) -> WriteResult<Option<String>> {
+    let before = parse_xmp(content).map_err(XmpWriteError::Parse)?;
+    let scan = scan_xmp(content)?;
+    let nl = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut editor = Editor {
+        content,
+        edits: Vec::new(),
+    };
+
+    let target = scan.descs.first();
+    let (xmp_prefix, xmp_decl, xmp_clash) = match target {
+        Some(t) => match &t.xmp {
+            Some(p) => (p.clone(), false, false),
+            None => ("xmp".to_string(), true, t.xmp_clash),
+        },
+        None => ("xmp".to_string(), true, false),
+    };
+    let quote = target.map_or('"', |t| t.quote as char);
+    let attr = |name: &str, value: &str| format!("{}={}{}{}", name, quote, value, quote);
+
+    let mut needs_xmp = false;
+    let mut needs_dc = false;
+    let mut rating_insert = None;
+    let mut label_insert = None;
+    let mut subject_insert = false;
+
+    let rating_text = values.rating.to_string();
+    if scan.ratings.is_empty() && values.rating != 0 {
+        needs_xmp = true;
+        rating_insert = Some(attr(&format!("{}:Rating", xmp_prefix), &rating_text));
+    }
+    for occ in &scan.ratings {
+        if occ.decoded.parse::<i8>() != Ok(values.rating) {
+            editor.set_value(&occ.loc, &rating_text);
+        }
+    }
+
+    let mut kept_label: Option<String> = None;
+    match &values.label {
+        Some(label) => {
+            let escaped = escape(label.as_str()).to_string();
+            if scan.labels.is_empty() {
+                needs_xmp = true;
+                label_insert = Some(attr(&format!("{}:Label", xmp_prefix), &escaped));
+            }
+            for occ in &scan.labels {
+                if occ.decoded.to_lowercase() != label.to_lowercase() {
+                    editor.set_value(&occ.loc, &escaped);
+                }
+            }
+        }
+        None => {
+            for occ in &scan.labels {
+                if normalize_label(&occ.decoded).is_some() {
+                    match &occ.loc {
+                        Loc::Attr(a) => editor.remove(a.whole.clone()),
+                        Loc::Elem(el) => editor.remove(el.whole.clone()),
+                    }
+                } else if kept_label.is_none() && !occ.decoded.is_empty() {
+                    kept_label = Some(occ.decoded.clone());
+                }
+            }
+        }
+    }
+
+    if needs_xmp && xmp_clash {
+        return Err(XmpWriteError::PrefixClash(
+            "prefix xmp is bound to another namespace".to_string(),
+        ));
+    }
+
+    let mut subject_items: Option<Vec<String>> = None;
+    if values.keywords.is_empty() {
+        for occ in &scan.subjects {
+            editor.remove(occ.elem.whole.clone());
+        }
+    } else if scan.subjects.len() == 1 && same_set(&scan.subjects[0].values, &values.keywords) {
+    } else if let Some(first) = scan.subjects.first() {
+        let desc = &scan.descs[first.desc];
+        let rdf = desc
+            .rdf
+            .clone()
+            .ok_or_else(|| unsupported("rdf namespace has no prefix"))?;
+        let indent = line_indent(content, first.elem.whole.start)
+            .or_else(|| desc.child_indent.clone())
+            .unwrap_or_else(|| format!("{} ", desc.indent.clone().unwrap_or_default()));
+        editor.replace(
+            first.elem.whole.clone(),
+            render_subject(&first.elem.qname, &rdf, &values.keywords, &indent, nl),
+        );
+        for occ in &scan.subjects[1..] {
+            editor.remove(occ.elem.whole.clone());
+        }
+    } else {
+        subject_insert = true;
+        needs_dc = true;
+        subject_items = Some(values.keywords.clone());
+    }
+
+    match target {
+        Some(t) => {
+            let dc_prefix = match &t.dc {
+                Some(p) => p.clone(),
+                None if needs_dc && t.dc_clash => {
+                    return Err(XmpWriteError::PrefixClash(
+                        "prefix dc is bound to another namespace".to_string(),
+                    ));
+                }
+                None => "dc".to_string(),
+            };
+            let dc_decl = t.dc.is_none() && needs_dc;
+            let mut attrs: Vec<String> = Vec::new();
+            if needs_xmp && xmp_decl {
+                attrs.push(attr("xmlns:xmp", NS_XMP_STR));
+            }
+            if dc_decl {
+                attrs.push(attr("xmlns:dc", NS_DC_STR));
+            }
+            attrs.extend(rating_insert);
+            attrs.extend(label_insert);
+            let attr_indent = t
+                .attr_indent
+                .clone()
+                .unwrap_or_else(|| format!("{}  ", t.indent.clone().unwrap_or_default()));
+            let mut attr_text = String::new();
+            for a in &attrs {
+                if t.multiline {
+                    attr_text.push_str(nl);
+                    attr_text.push_str(&attr_indent);
+                } else {
+                    attr_text.push(' ');
+                }
+                attr_text.push_str(a);
+            }
+
+            let desc_indent = t.indent.clone().unwrap_or_default();
+            let child_indent = t
+                .child_indent
+                .clone()
+                .unwrap_or_else(|| format!("{} ", desc_indent));
+            let block = if subject_insert {
+                let rdf = t
+                    .rdf
+                    .clone()
+                    .ok_or_else(|| unsupported("rdf namespace has no prefix"))?;
+                let items = subject_items.take().unwrap_or_default();
+                Some(format!(
+                    "{}{}",
+                    child_indent,
+                    render_subject(
+                        &format!("{}:subject", dc_prefix),
+                        &rdf,
+                        &items,
+                        &child_indent,
+                        nl
+                    )
+                ))
+            } else {
+                None
+            };
+
+            if t.self_closing {
+                if let Some(block) = block {
+                    editor.replace(
+                        t.attrs_end..t.tag_end,
+                        format!(">{nl}{block}{nl}{desc_indent}</{}>", t.qname,),
+                    );
+                    if !attr_text.is_empty() {
+                        editor.replace(t.attrs_end..t.attrs_end, attr_text);
+                    }
+                } else if !attr_text.is_empty() {
+                    editor.replace(t.attrs_end..t.attrs_end, attr_text);
+                }
+            } else {
+                if !attr_text.is_empty() {
+                    editor.replace(t.attrs_end..t.attrs_end, attr_text);
+                }
+                if let (Some(block), Some(end)) = (block, &t.end_tag) {
+                    match line_indent(content, end.start) {
+                        Some(indent) => editor.replace(
+                            end.start - indent.len()..end.start - indent.len(),
+                            format!("{block}{nl}"),
+                        ),
+                        None => editor.replace(
+                            end.start..end.start,
+                            format!("{nl}{block}{nl}{desc_indent}"),
+                        ),
+                    }
+                }
+            }
+        }
+        None => {
+            if rating_insert.is_some() || label_insert.is_some() || subject_insert {
+                let rdf = scan.rdf.as_ref().ok_or_else(|| parse_err("no rdf:RDF"))?;
+                let prefix = rdf
+                    .prefix
+                    .clone()
+                    .ok_or_else(|| unsupported("rdf namespace has no prefix"))?;
+                let end = rdf
+                    .end_tag
+                    .clone()
+                    .ok_or_else(|| parse_err("rdf:RDF without end tag"))?;
+                let rdf_indent = line_indent(content, end.start);
+                let base = rdf_indent.clone().unwrap_or_default();
+                let desc_indent = format!("{} ", base);
+                let child_indent = format!("{} ", desc_indent);
+                let mut open = format!(
+                    "<{0}:Description {0}:about=\"\" xmlns:xmp=\"{1}\" xmlns:dc=\"{2}\"",
+                    prefix, NS_XMP_STR, NS_DC_STR
                 );
-            }
-        } else {
-            let re_label_attr = regex!(r#"\s*xmp:Label\s*=\s*"[^"]*""#);
-            let re_label_tag = regex!(r#"\s*<xmp:Label\s*>[^<]*</xmp:Label>"#);
-            content = re_label_attr.replace_all(&content, "").to_string();
-            content = re_label_tag.replace_all(&content, "").to_string();
-        }
-
-        let re_subject = regex!(r#"(?s)<dc:subject>\s*<rdf:Bag>.*?</rdf:Bag>\s*</dc:subject>"#);
-        if normal_tags.is_empty() {
-            content = re_subject.replace_all(&content, "").to_string();
-        } else {
-            let escaped: Vec<_> = normal_tags
-                .iter()
-                .map(|t| partial_escape(t.as_str()))
-                .collect();
-            let bag = xmp_subject_bag(&escaped);
-
-            if re_subject.is_match(&content) {
-                content = re_subject.replace(&content, NoExpand(&bag)).to_string();
-            } else if let Some(last_index) = content.rfind("</rdf:Description>") {
-                let (start, end) = content.split_at(last_index);
-                content = format!("{} {}\n  {}", start, bag, end);
-            }
-        }
-
-        if !file_existed || content != original {
-            if let Err(e) = parse_xmp(&content) {
-                log::warn!("Not writing XMP {}: {}", xmp_file.display(), e);
-                return;
-            }
-            if let Err(e) = write_atomic(&xmp_file, content.as_bytes()) {
-                log::error!("Failed to write XMP {}: {}", xmp_file.display(), e);
+                if let Some(a) = &rating_insert {
+                    open.push(' ');
+                    open.push_str(a);
+                }
+                if let Some(a) = &label_insert {
+                    open.push(' ');
+                    open.push_str(a);
+                }
+                let body = if subject_insert {
+                    let items = subject_items.take().unwrap_or_default();
+                    format!(
+                        "{open}>{nl}{child_indent}{}{nl}{desc_indent}</{prefix}:Description>",
+                        render_subject("dc:subject", &prefix, &items, &child_indent, nl)
+                    )
+                } else {
+                    format!("{open}/>")
+                };
+                match rdf_indent {
+                    Some(indent) => {
+                        let at = end.start - indent.len();
+                        editor.replace(at..at, format!("{desc_indent}{body}{nl}"));
+                    }
+                    None => {
+                        editor.replace(end.start..end.start, format!("{nl}{desc_indent}{body}{nl}"))
+                    }
+                }
             }
         }
+    }
+
+    let out = editor.apply()?;
+    if out == content {
+        return Ok(None);
+    }
+
+    let after = parse_xmp(&out).map_err(XmpWriteError::Verify)?;
+    let rating_ok = after.rating == Some(values.rating)
+        || (values.rating == 0 && after.rating.is_none() && before.rating.is_none());
+    if !rating_ok {
+        return Err(XmpWriteError::Verify("rating differs".to_string()));
+    }
+    let label_ok = match (&after.label, &values.label, &kept_label) {
+        (Some(a), Some(v), _) => a.to_lowercase() == v.to_lowercase(),
+        (None, Some(_), _) => false,
+        (Some(a), None, Some(k)) => a.to_lowercase() == k.to_lowercase(),
+        (None, None, None) => true,
+        _ => false,
+    };
+    if !label_ok {
+        return Err(XmpWriteError::Verify("label differs".to_string()));
+    }
+    if !same_set(&after.subject, &values.keywords) {
+        return Err(XmpWriteError::Verify("keywords differ".to_string()));
+    }
+    Ok(Some(out))
+}
+
+pub(crate) fn write_xmp_sidecar(
+    sidecar_path: &Path,
+    source_path: &Path,
+    values: &XmpValues,
+    create_if_missing: bool,
+) -> WriteResult<bool> {
+    if is_virtual_copy(sidecar_path, source_path) {
+        return Ok(false);
+    }
+
+    let existing = resolve_xmp_path(source_path);
+    let (target, input, is_new) = match existing {
+        Some(path) => {
+            let content = fs::read_to_string(&path).map_err(XmpWriteError::Io)?;
+            (path, content, false)
+        }
+        None => {
+            if !create_if_missing {
+                return Ok(false);
+            }
+            (source_path.with_extension("xmp"), NEW_XMP.to_string(), true)
+        }
+    };
+
+    let out = update_xmp(&input, values)?;
+    if out.is_none() && !is_new {
+        return Ok(false);
+    }
+    let bytes = out.unwrap_or(input);
+    write_atomic(&target, bytes.as_bytes()).map_err(XmpWriteError::Io)?;
+    Ok(true)
+}
+
+pub fn sync_metadata_to_xmp(
+    sidecar_path: &Path,
+    source_path: &Path,
+    metadata: &ImageMetadata,
+    create_if_missing: bool,
+) {
+    let values = XmpValues::from_metadata(metadata);
+    if let Err(e) = write_xmp_sidecar(sidecar_path, source_path, &values, create_if_missing) {
+        log::warn!("Not writing XMP for {}: {}", source_path.display(), e);
     }
 }
