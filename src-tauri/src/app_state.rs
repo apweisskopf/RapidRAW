@@ -256,6 +256,27 @@ impl MetadataManager {
     }
 }
 
+pub struct BackfillItem {
+    pub image_path: PathBuf,
+    pub sidecar_path: PathBuf,
+}
+
+pub struct BackfillManager {
+    pub queue: Mutex<VecDeque<Vec<BackfillItem>>>,
+    pub cvar: Condvar,
+    pub pending: Mutex<HashSet<PathBuf>>,
+}
+
+impl BackfillManager {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queue: Mutex::new(VecDeque::new()),
+            cvar: Condvar::new(),
+            pending: Mutex::new(HashSet::new()),
+        })
+    }
+}
+
 pub type ThumbnailGeometryEntry = (u64, Arc<DynamicImage>, f32);
 pub type TransformedImageCache = (u64, Arc<DynamicImage>, f32, (f32, f32));
 pub type TransformedPreview = (Arc<DynamicImage>, f32, (f32, f32));
@@ -299,6 +320,7 @@ pub struct AppState {
     pub decoded_image_cache: Mutex<DecodedImageCache>,
     pub thumbnail_manager: Arc<ThumbnailManager>,
     pub metadata_manager: Arc<MetadataManager>,
+    pub backfill_manager: Arc<BackfillManager>,
     pub disks_cache: Mutex<Option<Disks>>,
     pub disks_cache_refreshing: AtomicBool,
     pub camera_session: Mutex<CameraSession>,

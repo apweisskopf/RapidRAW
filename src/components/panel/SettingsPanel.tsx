@@ -1264,9 +1264,12 @@ export default function SettingsPanel({
                                     checked={appSettings?.createXmpIfMissing ?? false}
                                     id="create-xmp-missing-toggle"
                                     label={t('settings.general.createXmpMissing')}
-                                    onChange={(checked) =>
-                                      onSettingsChange({ ...appSettings, createXmpIfMissing: checked })
-                                    }
+                                    onChange={async (checked) => {
+                                      await onSettingsChange({ ...appSettings, createXmpIfMissing: checked });
+                                      if (checked) {
+                                        onLibraryRefresh();
+                                      }
+                                    }}
                                   />
                                 </SettingItem>
                               </div>

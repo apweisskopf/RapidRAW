@@ -11,7 +11,10 @@ use quick_xml::name::{NamespaceResolver, PrefixDeclaration, ResolveResult};
 use quick_xml::reader::NsReader;
 use serde::{Deserialize, Serialize};
 
-use crate::file_management::{create_atomic, is_cloud_placeholder, write_atomic};
+use crate::app_settings::AppSettings;
+use crate::file_management::{
+    create_atomic, is_cloud_placeholder, replace_if_unchanged, write_atomic,
+};
 use crate::image_processing::{ImageFlag, ImageMetadata, default_adjustments};
 use crate::tagging::{COLOR_TAG_PREFIX, USER_TAG_PREFIX};
 
@@ -2293,4 +2296,143 @@ pub(crate) fn xmp_conflict_info(
         rr: rr_state(&metadata),
         xmp: side.xmp,
     }))
+}
+
+pub(crate) fn needs_backfill(
+    image_path: &Path,
+    metadata: &ImageMetadata,
+    siblings: &StemSiblings,
+    settings: &AppSettings,
+) -> bool {
+    settings.enable_xmp_sync.unwrap_or(false)
+        && settings.create_xmp_if_missing.unwrap_or(false)
+        && !metadata.xmp_conflict
+        && !rr_state(metadata).is_empty()
+        && locate_sidecar(image_path, siblings).is_some_and(|located| {
+            located.existing.is_none()
+                && matching_base(metadata, &sidecar_file_name(&located.create_at)).is_none()
+        })
+}
+
+fn is_dead_folder_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::ReadOnlyFilesystem
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::TimedOut
+    )
+}
+
+pub(crate) fn write_rrdata_if_unchanged(
+    rrdata_path: &Path,
+    original: &[u8],
+    metadata: &ImageMetadata,
+) -> std::io::Result<bool> {
+    let json = serde_json::to_string_pretty(metadata).map_err(std::io::Error::other)?;
+    replace_if_unchanged(rrdata_path, original, json.as_bytes())
+}
+
+pub(crate) struct BackfillBatch {
+    cache: SiblingCache,
+    skip_dirs: HashSet<PathBuf>,
+    warned: HashSet<PathBuf>,
+    created: usize,
+}
+
+impl BackfillBatch {
+    pub(crate) fn new() -> Self {
+        BackfillBatch {
+            cache: SiblingCache::new(),
+            skip_dirs: HashSet::new(),
+            warned: HashSet::new(),
+            created: 0,
+        }
+    }
+
+    fn fail_dir(&mut self, dir: &Path, skip: bool, message: &str) {
+        if skip {
+            self.skip_dirs.insert(dir.to_path_buf());
+        }
+        if self.warned.insert(dir.to_path_buf()) {
+            log::warn!("XMP backfill in {}: {}", dir.display(), message);
+        }
+    }
+
+    pub(crate) fn run(
+        &mut self,
+        image_path: &Path,
+        rrdata_path: &Path,
+        settings: &AppSettings,
+    ) -> bool {
+        if !settings.enable_xmp_sync.unwrap_or(false)
+            || !settings.create_xmp_if_missing.unwrap_or(false)
+        {
+            return false;
+        }
+        let Some(dir) = image_path.parent() else {
+            return false;
+        };
+        if self.skip_dirs.contains(dir)
+            || is_cloud_placeholder(rrdata_path)
+            || is_cloud_placeholder(image_path)
+        {
+            return false;
+        }
+        let Ok(bytes) = fs::read(rrdata_path) else {
+            return false;
+        };
+        let Ok(mut metadata) = serde_json::from_slice::<ImageMetadata>(&bytes) else {
+            return false;
+        };
+        let Some(siblings) = self.cache.get(dir) else {
+            self.fail_dir(dir, true, "cannot list the folder");
+            return false;
+        };
+        if !needs_backfill(image_path, &metadata, &siblings, settings) {
+            return false;
+        }
+        let Some(located) = locate_sidecar(image_path, &siblings) else {
+            return false;
+        };
+        let target = located.create_at;
+
+        let rr = rr_state(&metadata);
+        let content = match update_xmp(NEW_XMP, &rr.to_values()) {
+            Ok(out) => out.unwrap_or_else(|| NEW_XMP.to_string()),
+            Err(e) => {
+                self.fail_dir(dir, false, &e.to_string());
+                return false;
+            }
+        };
+        match create_atomic(&target, content.as_bytes()) {
+            Ok(true) => {}
+            Ok(false) => {
+                log::debug!("XMP sidecar {} already exists", target.display());
+                return false;
+            }
+            Err(e) => {
+                self.fail_dir(dir, is_dead_folder_error(e.kind()), &e.to_string());
+                return false;
+            }
+        }
+        self.created += 1;
+
+        set_base(&mut metadata, &sidecar_file_name(&target), &rr);
+        match write_rrdata_if_unchanged(rrdata_path, &bytes, &metadata) {
+            Ok(true) => {}
+            Ok(false) => log::debug!(
+                "Skipping XMP base for {}, the rrdata changed",
+                image_path.display()
+            ),
+            Err(e) => self.fail_dir(dir, is_dead_folder_error(e.kind()), &e.to_string()),
+        }
+        true
+    }
+
+    pub(crate) fn finish(self) {
+        if self.created > 0 {
+            log::info!("Created {} XMP sidecars from rrdata", self.created);
+        }
+    }
 }

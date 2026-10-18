@@ -8,8 +8,8 @@ use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::Result;
@@ -26,6 +26,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::AppState;
+use crate::BackfillItem;
 use crate::PendingMetadata;
 #[cfg(target_os = "android")]
 use crate::android_integration::*;
@@ -92,6 +93,7 @@ struct ImageFileMetadata {
     flag: Option<ImageFlag>,
     is_raw: bool,
     xmp_conflict: bool,
+    backfill: bool,
 }
 
 fn edited_state(
@@ -136,6 +138,11 @@ fn resolve_image_metadata(
     }
 
     let (is_edited, is_raw) = edited_state(image_path, &metadata, settings);
+    let backfill = !virtual_copy
+        && siblings.is_some_and(|siblings| {
+            crate::xmp_sidecar::needs_backfill(image_path, &metadata, siblings, settings)
+        })
+        && !is_cloud_placeholder(image_path);
     ImageFileMetadata {
         is_edited,
         tags: metadata.tags,
@@ -143,6 +150,7 @@ fn resolve_image_metadata(
         flag: metadata.flag,
         is_raw,
         xmp_conflict: metadata.xmp_conflict && !virtual_copy,
+        backfill,
     }
 }
 
@@ -280,6 +288,71 @@ pub fn start_metadata_workers(app_handle: tauri::AppHandle) {
             }
         });
     }
+}
+
+fn enqueue_backfill(app_handle: &AppHandle, items: Vec<BackfillItem>) {
+    let state = app_handle.state::<crate::AppState>();
+    let manager = &state.backfill_manager;
+
+    let fresh: Vec<BackfillItem> = {
+        let mut pending = manager.pending.lock().unwrap();
+        items
+            .into_iter()
+            .filter(|item| pending.insert(item.sidecar_path.clone()))
+            .collect()
+    };
+    if fresh.is_empty() {
+        return;
+    }
+
+    manager.queue.lock().unwrap().push_back(fresh);
+    manager.cvar.notify_one();
+}
+
+fn backfill_item(
+    backfill: bool,
+    image_path: &Path,
+    sidecar_path: &Path,
+    only_in: Option<&Path>,
+) -> Option<BackfillItem> {
+    (backfill && only_in.is_none_or(|dir| image_path.parent() == Some(dir))).then(|| BackfillItem {
+        image_path: image_path.to_path_buf(),
+        sidecar_path: sidecar_path.to_path_buf(),
+    })
+}
+
+pub fn start_backfill_worker(app_handle: tauri::AppHandle) {
+    let state = app_handle.state::<crate::AppState>();
+    let manager = state.backfill_manager.clone();
+
+    std::thread::spawn(move || {
+        loop {
+            let batch = {
+                let mut queue = manager.queue.lock().unwrap();
+                while queue.is_empty() {
+                    queue = manager.cvar.wait(queue).unwrap();
+                }
+                queue.pop_front().unwrap()
+            };
+
+            let mut run = crate::xmp_sidecar::BackfillBatch::new();
+            let mut stopped = false;
+            for item in batch {
+                if !stopped {
+                    let settings = load_settings(app_handle.clone()).unwrap_or_default();
+                    if settings.enable_xmp_sync.unwrap_or(false)
+                        && settings.create_xmp_if_missing.unwrap_or(false)
+                    {
+                        run.run(&item.image_path, &item.sidecar_path, &settings);
+                    } else {
+                        stopped = true;
+                    }
+                }
+                manager.pending.lock().unwrap().remove(&item.sidecar_path);
+            }
+            run.finish();
+        }
+    });
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -689,6 +762,7 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
     }
 
     let siblings = StemSiblings::from_names(all_names.iter().map(String::as_str));
+    let backfill_candidates: Mutex<Vec<BackfillItem>> = Mutex::new(Vec::new());
 
     let tasks: Vec<_> = images
         .into_iter()
@@ -746,6 +820,7 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
                         flag: None,
                         is_raw: crate::formats::is_raw_file(&path_buf),
                         xmp_conflict: false,
+                        backfill: false,
                     }
                 } else {
                     resolve_image_metadata(
@@ -756,6 +831,13 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
                         Some(&siblings),
                     )
                 };
+
+                if metadata.backfill {
+                    backfill_candidates.lock().unwrap().push(BackfillItem {
+                        image_path: path_buf.clone(),
+                        sidecar_path: sidecar_path.clone(),
+                    });
+                }
 
                 file_results.push(ImageFile {
                     path: virtual_path,
@@ -777,6 +859,11 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
         })
         .collect();
 
+    let candidates = backfill_candidates.into_inner().unwrap_or_default();
+    if !candidates.is_empty() {
+        enqueue_backfill(&app_handle, candidates);
+    }
+
     assign_group_ids(&mut result_list, &settings);
     Ok(result_list)
 }
@@ -793,6 +880,7 @@ pub fn list_images_recursive(
 
     let root_path = Path::new(&path);
     let mut images = Vec::new();
+    let backfill_candidates: Mutex<Vec<BackfillItem>> = Mutex::new(Vec::new());
 
     let mut sidecars_by_path: HashMap<PathBuf, Vec<Option<String>>> = HashMap::new();
     let sibling_cache = SiblingCache::new();
@@ -878,6 +966,7 @@ pub fn list_images_recursive(
                         flag: None,
                         is_raw: crate::formats::is_raw_file(&path_buf),
                         xmp_conflict: false,
+                        backfill: false,
                     }
                 } else {
                     resolve_image_metadata(
@@ -888,6 +977,12 @@ pub fn list_images_recursive(
                         siblings.as_deref(),
                     )
                 };
+
+                if let Some(item) =
+                    backfill_item(metadata.backfill, &path_buf, &sidecar_path, Some(root_path))
+                {
+                    backfill_candidates.lock().unwrap().push(item);
+                }
 
                 file_results.push(ImageFile {
                     path: virtual_path,
@@ -908,6 +1003,11 @@ pub fn list_images_recursive(
             file_results
         })
         .collect();
+
+    let candidates = backfill_candidates.into_inner().unwrap_or_default();
+    if !candidates.is_empty() {
+        enqueue_backfill(&app_handle, candidates);
+    }
 
     assign_group_ids(&mut result_list, &settings);
     Ok(result_list)
@@ -1160,6 +1260,7 @@ pub fn get_album_images(
                     flag: None,
                     is_raw: crate::formats::is_raw_file(&source_path),
                     xmp_conflict: false,
+                    backfill: false,
                 }
             } else {
                 resolve_image_metadata(
@@ -4414,6 +4515,30 @@ pub(crate) fn create_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<bool> 
             Ok(true)
         }
     }
+}
+
+pub(crate) fn replace_if_unchanged(
+    path: &Path,
+    original: &[u8],
+    bytes: &[u8],
+) -> std::io::Result<bool> {
+    let target = match fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let parent = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let tmp = new_xmp_tempfile(parent, bytes)?;
+    tmp.as_file()
+        .set_permissions(fs::metadata(&target)?.permissions())?;
+    if !fs::read(&target).is_ok_and(|now| now == original) {
+        return Ok(false);
+    }
+    tmp.persist(&target).map_err(|e| e.error)?;
+    Ok(true)
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
