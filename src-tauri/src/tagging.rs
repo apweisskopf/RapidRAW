@@ -18,6 +18,7 @@ use crate::file_management::{self, parse_virtual_path};
 use crate::formats::is_supported_image_file;
 use crate::hierarchy::TAG_HIERARCHY;
 use crate::image_processing::ImageMetadata;
+use crate::xmp_sidecar::SiblingCache;
 use crate::{AppState, candidates::TAG_CANDIDATES};
 
 pub const COLOR_TAG_PREFIX: &str = "color:";
@@ -428,6 +429,7 @@ pub async fn start_background_indexing(
 fn modify_tags_for_path(
     path_str: &str,
     app_handle: &AppHandle,
+    sibling_cache: &SiblingCache,
     modify_fn: impl Fn(&mut Vec<String>),
 ) -> Result<(), String> {
     let (source_path, sidecar_path) = parse_virtual_path(path_str);
@@ -447,8 +449,15 @@ fn modify_tags_for_path(
     }
 
     let settings = crate::load_settings(app_handle.clone()).unwrap_or_default();
-    if file_management::write_sidecar_and_xmp(&source_path, &sidecar_path, &mut metadata, &settings)
-        .map_err(|e| e.to_string())?
+    let siblings = source_path.parent().and_then(|dir| sibling_cache.get(dir));
+    if file_management::write_sidecar_and_xmp(
+        &source_path,
+        &sidecar_path,
+        &mut metadata,
+        &settings,
+        siblings.as_deref(),
+    )
+    .map_err(|e| e.to_string())?
     {
         file_management::emit_synced_metadata(
             app_handle,
@@ -468,9 +477,10 @@ pub fn add_tag_for_paths(
     tag: String,
     app_handle: AppHandle,
 ) -> Result<(), String> {
+    let sibling_cache = SiblingCache::new();
     paths.par_iter().for_each(|path| {
         let tag_clone = tag.clone();
-        if let Err(e) = modify_tags_for_path(path, &app_handle, |tags| {
+        if let Err(e) = modify_tags_for_path(path, &app_handle, &sibling_cache, |tags| {
             if !tags.contains(&tag_clone) {
                 tags.push(tag_clone.clone());
             }
@@ -487,9 +497,10 @@ pub fn remove_tag_for_paths(
     tag: String,
     app_handle: AppHandle,
 ) -> Result<(), String> {
+    let sibling_cache = SiblingCache::new();
     paths.par_iter().for_each(|path| {
         let tag_clone = tag.clone();
-        if let Err(e) = modify_tags_for_path(path, &app_handle, |tags| {
+        if let Err(e) = modify_tags_for_path(path, &app_handle, &sibling_cache, |tags| {
             tags.retain(|t| t != &tag_clone);
         }) {
             eprintln!("Failed to remove tag from {}: {}", path, e);
@@ -509,11 +520,19 @@ fn write_rrdata(
     rrdata_path: &Path,
     metadata: &mut ImageMetadata,
     settings: &crate::app_settings::AppSettings,
+    sibling_cache: &SiblingCache,
 ) -> std::io::Result<()> {
     match rrdata_source_path(rrdata_path) {
         Some(source_path) => {
-            file_management::write_sidecar_and_xmp(&source_path, rrdata_path, metadata, settings)
-                .map(|_| ())
+            let siblings = source_path.parent().and_then(|dir| sibling_cache.get(dir));
+            file_management::write_sidecar_and_xmp(
+                &source_path,
+                rrdata_path,
+                metadata,
+                settings,
+                siblings.as_deref(),
+            )
+            .map(|_| ())
         }
         None => {
             let json_string =
@@ -531,6 +550,7 @@ pub fn clear_ai_tags(root_path: String, app_handle: AppHandle) -> Result<usize, 
 
     let settings = crate::load_settings(app_handle.clone()).unwrap_or_default();
 
+    let sibling_cache = SiblingCache::new();
     let mut updated_count = 0;
     let walker = WalkDir::new(root_path).into_iter();
 
@@ -552,7 +572,7 @@ pub fn clear_ai_tags(root_path: String, app_handle: AppHandle) -> Result<usize, 
                 if tags.is_empty() {
                     metadata.tags = None;
                 }
-                if write_rrdata(path, &mut metadata, &settings).is_ok() {
+                if write_rrdata(path, &mut metadata, &settings, &sibling_cache).is_ok() {
                     updated_count += 1;
                 }
             }
@@ -569,6 +589,7 @@ pub fn clear_all_tags(root_path: String, app_handle: AppHandle) -> Result<usize,
 
     let settings = crate::load_settings(app_handle.clone()).unwrap_or_default();
 
+    let sibling_cache = SiblingCache::new();
     let mut updated_count = 0;
     let walker = WalkDir::new(root_path).into_iter();
 
@@ -588,7 +609,7 @@ pub fn clear_all_tags(root_path: String, app_handle: AppHandle) -> Result<usize,
                 if tags.is_empty() {
                     metadata.tags = None;
                 }
-                if write_rrdata(path, &mut metadata, &settings).is_ok() {
+                if write_rrdata(path, &mut metadata, &settings, &sibling_cache).is_ok() {
                     updated_count += 1;
                 }
             }

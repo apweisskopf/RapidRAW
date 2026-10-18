@@ -46,6 +46,7 @@ use crate::image_processing::{
 use crate::mask_generation::MaskDefinition;
 use crate::preset_converter;
 use crate::tagging::COLOR_TAG_PREFIX;
+use crate::xmp_sidecar::{SiblingCache, StemSiblings};
 
 fn resolve_thumbnail_cache_dir(app_handle: &AppHandle) -> std::result::Result<PathBuf, String> {
     let cache_dir = app_handle
@@ -105,18 +106,31 @@ fn edited_state(
     (is_edited, is_raw)
 }
 
+fn xmp_sidecar_is_placeholder(image_path: &Path, siblings: Option<&StemSiblings>) -> bool {
+    siblings
+        .and_then(|siblings| crate::xmp_sidecar::locate_sidecar(image_path, siblings))
+        .and_then(|located| located.existing)
+        .is_some_and(|p| is_cloud_placeholder(&p))
+}
+
+fn siblings_for(cache: &SiblingCache, image_path: &Path) -> Option<Arc<StemSiblings>> {
+    cache.get(image_path.parent()?)
+}
+
 fn resolve_image_metadata(
     image_path: &Path,
     sidecar_path: &Path,
     enable_xmp_sync: bool,
     settings: &AppSettings,
+    siblings: Option<&StemSiblings>,
 ) -> ImageFileMetadata {
     let mut metadata = crate::exif_processing::load_sidecar(sidecar_path);
     let virtual_copy = is_virtual_copy(sidecar_path, image_path);
 
     if enable_xmp_sync
         && !virtual_copy
-        && crate::xmp_sidecar::sync_on_load(image_path, &mut metadata)
+        && let Some(siblings) = siblings
+        && crate::xmp_sidecar::sync_on_load(image_path, &mut metadata, siblings)
     {
         let _ = crate::exif_processing::write_sidecar(sidecar_path, image_path, &metadata);
     }
@@ -137,16 +151,20 @@ pub(crate) fn write_sidecar_and_xmp(
     sidecar_path: &Path,
     metadata: &mut ImageMetadata,
     settings: &AppSettings,
+    siblings: Option<&StemSiblings>,
 ) -> std::io::Result<bool> {
     let mut changed = false;
     if is_virtual_copy(sidecar_path, source_path) {
         metadata.xmp_sync = None;
         metadata.xmp_conflict = false;
-    } else if settings.enable_xmp_sync.unwrap_or(false) {
+    } else if settings.enable_xmp_sync.unwrap_or(false)
+        && let Some(siblings) = siblings
+    {
         let conflict_before = metadata.xmp_conflict;
         let create_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
-        changed = crate::xmp_sidecar::sync_on_save(source_path, metadata, create_if_missing)
-            || metadata.xmp_conflict != conflict_before;
+        changed =
+            crate::xmp_sidecar::sync_on_save(source_path, metadata, create_if_missing, siblings)
+                || metadata.xmp_conflict != conflict_before;
     }
     crate::exif_processing::write_sidecar(sidecar_path, source_path, metadata)?;
     Ok(changed)
@@ -235,11 +253,13 @@ pub fn start_metadata_workers(app_handle: tauri::AppHandle) {
                 let settings = load_settings(app_clone.clone()).unwrap_or_default();
                 let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
 
+                let siblings = item.image_path.parent().and_then(StemSiblings::from_dir);
                 let metadata = resolve_image_metadata(
                     &item.image_path,
                     &item.sidecar_path,
                     enable_xmp_sync,
                     &settings,
+                    siblings.as_ref(),
                 );
 
                 emit_image_metadata_loaded(
@@ -645,14 +665,18 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
 
     let entries = fs::read_dir(&path).map_err(|e| e.to_string())?;
     let mut images = Vec::new();
+    let mut all_names: Vec<String> = Vec::new();
     let mut sidecars_by_filename: HashMap<String, Vec<Option<String>>> = HashMap::new();
 
     for entry in entries.filter_map(Result::ok) {
         let entry_path = entry.path();
-        let file_name = entry
-            .file_name()
-            .into_string()
-            .unwrap_or_else(|os| os.to_string_lossy().into_owned());
+        let file_name = match entry.file_name().into_string() {
+            Ok(name) => {
+                all_names.push(name.clone());
+                name
+            }
+            Err(os) => os.to_string_lossy().into_owned(),
+        };
 
         if let Some((source_filename, copy_id)) = parse_sidecar_name(&file_name) {
             sidecars_by_filename
@@ -663,6 +687,8 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
             images.push((file_name, entry_path));
         }
     }
+
+    let siblings = StemSiblings::from_names(all_names.iter().map(String::as_str));
 
     let tasks: Vec<_> = images
         .into_iter()
@@ -701,9 +727,8 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
 
                 let sidecar_path = path_buf.with_file_name(sidecar_filename);
 
-                let xmp_is_placeholder = enable_xmp_sync
-                    && crate::xmp_sidecar::resolve_xmp_path(&path_buf)
-                        .is_some_and(|p| crate::file_management::is_cloud_placeholder(&p));
+                let xmp_is_placeholder =
+                    enable_xmp_sync && xmp_sidecar_is_placeholder(&path_buf, Some(&siblings));
 
                 let metadata = if crate::file_management::is_cloud_placeholder(&sidecar_path)
                     || xmp_is_placeholder
@@ -723,7 +748,13 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
                         xmp_conflict: false,
                     }
                 } else {
-                    resolve_image_metadata(&path_buf, &sidecar_path, enable_xmp_sync, &settings)
+                    resolve_image_metadata(
+                        &path_buf,
+                        &sidecar_path,
+                        enable_xmp_sync,
+                        &settings,
+                        Some(&siblings),
+                    )
                 };
 
                 file_results.push(ImageFile {
@@ -764,6 +795,7 @@ pub fn list_images_recursive(
     let mut images = Vec::new();
 
     let mut sidecars_by_path: HashMap<PathBuf, Vec<Option<String>>> = HashMap::new();
+    let sibling_cache = SiblingCache::new();
 
     for entry in WalkDir::new(root_path).into_iter().filter_map(Result::ok) {
         let entry_path = entry.path();
@@ -811,6 +843,7 @@ pub fn list_images_recursive(
                 .unwrap_or(0);
 
             let is_cloud_placeholder = is_cloud_placeholder(&path_buf);
+            let siblings = siblings_for(&sibling_cache, &path_buf);
 
             let mut file_results = Vec::with_capacity(sidecars.len());
 
@@ -826,9 +859,8 @@ pub fn list_images_recursive(
 
                 let sidecar_path = path_buf.with_file_name(sidecar_filename);
 
-                let xmp_is_placeholder = enable_xmp_sync
-                    && crate::xmp_sidecar::resolve_xmp_path(&path_buf)
-                        .is_some_and(|p| crate::file_management::is_cloud_placeholder(&p));
+                let xmp_is_placeholder =
+                    enable_xmp_sync && xmp_sidecar_is_placeholder(&path_buf, siblings.as_deref());
 
                 let metadata = if crate::file_management::is_cloud_placeholder(&sidecar_path)
                     || xmp_is_placeholder
@@ -848,7 +880,13 @@ pub fn list_images_recursive(
                         xmp_conflict: false,
                     }
                 } else {
-                    resolve_image_metadata(&path_buf, &sidecar_path, enable_xmp_sync, &settings)
+                    resolve_image_metadata(
+                        &path_buf,
+                        &sidecar_path,
+                        enable_xmp_sync,
+                        &settings,
+                        siblings.as_deref(),
+                    )
                 };
 
                 file_results.push(ImageFile {
@@ -1082,6 +1120,7 @@ pub fn get_album_images(
 ) -> Result<Vec<ImageFile>, String> {
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
     let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
+    let sibling_cache = SiblingCache::new();
 
     let mut result_list: Vec<ImageFile> = paths
         .into_par_iter()
@@ -1100,10 +1139,10 @@ pub fn get_album_images(
 
             let is_virtual_copy = virtual_path.contains("?vc=");
             let is_cloud_placeholder = is_cloud_placeholder(&source_path);
+            let siblings = siblings_for(&sibling_cache, &source_path);
 
-            let xmp_is_placeholder = enable_xmp_sync
-                && crate::xmp_sidecar::resolve_xmp_path(&source_path)
-                    .is_some_and(|p| crate::file_management::is_cloud_placeholder(&p));
+            let xmp_is_placeholder =
+                enable_xmp_sync && xmp_sidecar_is_placeholder(&source_path, siblings.as_deref());
 
             let metadata = if crate::file_management::is_cloud_placeholder(&sidecar_path)
                 || xmp_is_placeholder
@@ -1123,7 +1162,13 @@ pub fn get_album_images(
                     xmp_conflict: false,
                 }
             } else {
-                resolve_image_metadata(&source_path, &sidecar_path, enable_xmp_sync, &settings)
+                resolve_image_metadata(
+                    &source_path,
+                    &sidecar_path,
+                    enable_xmp_sync,
+                    &settings,
+                    siblings.as_deref(),
+                )
             };
 
             Some(ImageFile {
@@ -2640,8 +2685,15 @@ pub fn save_metadata_and_update_thumbnail(
     metadata.adjustments = final_adjustments;
 
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
-    if write_sidecar_and_xmp(&source_path, &sidecar_path, &mut metadata, &settings)
-        .map_err(|e| e.to_string())?
+    let siblings = source_path.parent().and_then(StemSiblings::from_dir);
+    if write_sidecar_and_xmp(
+        &source_path,
+        &sidecar_path,
+        &mut metadata,
+        &settings,
+        siblings.as_ref(),
+    )
+    .map_err(|e| e.to_string())?
     {
         emit_synced_metadata(&app_handle, &path, &source_path, &metadata, &settings);
     }
@@ -2728,6 +2780,7 @@ pub async fn apply_adjustments_to_paths(
             .unwrap()
             .clone();
 
+        let sibling_cache = SiblingCache::new();
         paths.par_iter().for_each(|path| {
             let (source_path, sidecar_path) = parse_virtual_path(path);
 
@@ -2760,6 +2813,7 @@ pub async fn apply_adjustments_to_paths(
                 &sidecar_path,
                 &mut existing_metadata,
                 &settings,
+                siblings_for(&sibling_cache, &source_path).as_deref(),
             ) {
                 emit_synced_metadata(
                     &app_handle,
@@ -2788,6 +2842,7 @@ pub async fn reset_adjustments_for_paths(
     tauri::async_runtime::spawn_blocking(move || {
         let settings = load_settings(app_handle.clone()).unwrap_or_default();
 
+        let sibling_cache = SiblingCache::new();
         paths.par_iter().for_each(|path| {
             let (source_path, sidecar_path) = parse_virtual_path(path);
 
@@ -2800,6 +2855,7 @@ pub async fn reset_adjustments_for_paths(
                 &sidecar_path,
                 &mut existing_metadata,
                 &settings,
+                siblings_for(&sibling_cache, &source_path).as_deref(),
             ) {
                 emit_synced_metadata(
                     &app_handle,
@@ -2884,6 +2940,7 @@ pub async fn apply_auto_lens_correction_to_paths(
     tauri::async_runtime::spawn_blocking(move || {
         let settings = sidecar_settings;
         let app_handle = sidecar_app_handle;
+        let sibling_cache = SiblingCache::new();
         sidecar_paths.par_iter().for_each(|path| {
             let (source_path, sidecar_path) = parse_virtual_path(path);
             let mut existing_metadata =
@@ -2911,6 +2968,7 @@ pub async fn apply_auto_lens_correction_to_paths(
                 &sidecar_path,
                 &mut existing_metadata,
                 &settings,
+                siblings_for(&sibling_cache, &source_path).as_deref(),
             ) {
                 emit_synced_metadata(
                     &app_handle,
@@ -2965,6 +3023,7 @@ async fn update_sidecars_from_images(
 
         let gpu_context = gpu_processing::get_or_init_gpu_context(&state, &app_handle).ok();
 
+        let sibling_cache = SiblingCache::new();
         let process = |path: &String| {
             let loaded_image: Option<DynamicImage> = (|| -> Result<DynamicImage, String> {
                 let (source_path, sidecar_path) = parse_virtual_path(path);
@@ -2998,6 +3057,7 @@ async fn update_sidecars_from_images(
                     &sidecar_path,
                     &mut existing_metadata,
                     &settings,
+                    siblings_for(&sibling_cache, &source_path).as_deref(),
                 ) {
                     emit_synced_metadata(
                         &app_handle,
@@ -3119,6 +3179,7 @@ fn update_metadata_for_paths(
     update: impl Fn(&mut ImageMetadata) + Sync,
 ) {
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
+    let sibling_cache = SiblingCache::new();
 
     paths.par_iter().for_each(|path| {
         let (source_path, sidecar_path) = parse_virtual_path(path);
@@ -3127,9 +3188,13 @@ fn update_metadata_for_paths(
 
         update(&mut metadata);
 
-        if let Ok(true) =
-            write_sidecar_and_xmp(&source_path, &sidecar_path, &mut metadata, &settings)
-        {
+        if let Ok(true) = write_sidecar_and_xmp(
+            &source_path,
+            &sidecar_path,
+            &mut metadata,
+            &settings,
+            siblings_for(&sibling_cache, &source_path).as_deref(),
+        ) {
             emit_synced_metadata(app_handle, path, &source_path, &metadata, &settings);
         }
     });
@@ -3198,7 +3263,8 @@ pub fn load_metadata(path: String, app_handle: AppHandle) -> Result<ImageMetadat
 
     if enable_xmp_sync
         && !is_virtual_copy(&sidecar_path, &source_path)
-        && crate::xmp_sidecar::sync_on_load(&source_path, &mut metadata)
+        && let Some(siblings) = source_path.parent().and_then(StemSiblings::from_dir)
+        && crate::xmp_sidecar::sync_on_load(&source_path, &mut metadata, &siblings)
     {
         let _ = crate::exif_processing::write_sidecar(&sidecar_path, &source_path, &metadata);
     }
@@ -3215,7 +3281,10 @@ pub fn get_xmp_conflict(
         return Ok(None);
     }
     let metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-    crate::xmp_sidecar::xmp_conflict_info(&source_path, &metadata)
+    let Some(siblings) = source_path.parent().and_then(StemSiblings::from_dir) else {
+        return Ok(None);
+    };
+    crate::xmp_sidecar::xmp_conflict_info(&source_path, &metadata, &siblings)
 }
 
 fn resolve_xmp_conflicts(
@@ -3225,6 +3294,7 @@ fn resolve_xmp_conflicts(
 ) -> Result<(), String> {
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
     let mut errors = Vec::new();
+    let sibling_cache = SiblingCache::new();
     for path in paths {
         let (source_path, sidecar_path) = parse_virtual_path(path);
         if is_virtual_copy(&sidecar_path, &source_path) {
@@ -3234,8 +3304,12 @@ fn resolve_xmp_conflicts(
         if !metadata.xmp_conflict {
             continue;
         }
+        let Some(siblings) = siblings_for(&sibling_cache, &source_path) else {
+            errors.push(format!("cannot read folder of {}", source_path.display()));
+            continue;
+        };
         if let Err(e) =
-            crate::xmp_sidecar::resolve_xmp_conflict(&source_path, &mut metadata, choice)
+            crate::xmp_sidecar::resolve_xmp_conflict(&source_path, &mut metadata, choice, &siblings)
         {
             errors.push(e);
             continue;
@@ -4306,9 +4380,43 @@ pub fn create_virtual_copy(
     Ok(new_virtual_path)
 }
 
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn new_xmp_tempfile(parent: &Path, bytes: &[u8]) -> std::io::Result<tempfile::NamedTempFile> {
     use std::io::Write;
 
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".rapidraw-").suffix(".xmp.tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+
+    let mut tmp = builder.tempfile_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    Ok(tmp)
+}
+
+pub(crate) fn create_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let tmp = new_xmp_tempfile(parent, bytes)?;
+    match tmp.persist_noclobber(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => {
+            if path.exists() {
+                return Ok(false);
+            }
+            e.file.persist(path).map_err(|e| e.error)?;
+            Ok(true)
+        }
+    }
+}
+
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Ok(link) = fs::symlink_metadata(path)
         && link.file_type().is_symlink()
         && !path.exists()
@@ -4332,17 +4440,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         _ => Path::new("."),
     };
 
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(".rapidraw-").suffix(".xmp.tmp");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(fs::Permissions::from_mode(0o666));
-    }
-
-    let mut tmp = builder.tempfile_in(parent)?;
-    tmp.write_all(bytes)?;
-    tmp.as_file().sync_all()?;
+    let tmp = new_xmp_tempfile(parent, bytes)?;
 
     if existing {
         let perms = fs::metadata(&target)?.permissions();

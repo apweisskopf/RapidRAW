@@ -1,8 +1,8 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use quick_xml::XmlVersion;
 use quick_xml::escape::{escape, unescape};
@@ -11,7 +11,7 @@ use quick_xml::name::{NamespaceResolver, PrefixDeclaration, ResolveResult};
 use quick_xml::reader::NsReader;
 use serde::{Deserialize, Serialize};
 
-use crate::file_management::{is_cloud_placeholder, write_atomic};
+use crate::file_management::{create_atomic, is_cloud_placeholder, write_atomic};
 use crate::image_processing::{ImageFlag, ImageMetadata, default_adjustments};
 use crate::tagging::{COLOR_TAG_PREFIX, USER_TAG_PREFIX};
 
@@ -394,11 +394,102 @@ pub struct SidecarPaths {
     pub create_at: PathBuf,
 }
 
-fn full_name_sidecar(image_path: &Path, extension: &str) -> Option<PathBuf> {
-    let mut name = image_path.file_name()?.to_os_string();
-    name.push(".");
-    name.push(extension);
-    Some(image_path.with_file_name(name))
+const EXTRA_MEMBER_EXTENSIONS: [&str; 5] = ["heic", "heif", "avif", "psd", "psb"];
+
+#[derive(Default)]
+pub struct StemSiblings {
+    members: HashMap<String, Vec<String>>,
+    xmp_names: HashMap<String, Vec<String>>,
+}
+
+fn split_stem(name: &str) -> Option<(&str, &str)> {
+    name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty())
+}
+
+fn is_stem_member(name: &str) -> bool {
+    if crate::formats::is_supported_image_file(name) {
+        return true;
+    }
+    !name.starts_with('.')
+        && split_stem(name).is_some_and(|(_, ext)| {
+            EXTRA_MEMBER_EXTENSIONS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(ext))
+        })
+}
+
+fn is_sidecar_raw(name: &str) -> bool {
+    crate::formats::is_raw_file(name)
+        && split_stem(name).is_some_and(|(_, ext)| !ext.eq_ignore_ascii_case("dng"))
+}
+
+impl StemSiblings {
+    pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut siblings = StemSiblings::default();
+        for name in names {
+            let lower = name.to_ascii_lowercase();
+            if lower.ends_with(".xmp") {
+                siblings
+                    .xmp_names
+                    .entry(lower)
+                    .or_default()
+                    .push(name.to_string());
+            } else if is_stem_member(name)
+                && let Some((stem, _)) = split_stem(name)
+            {
+                siblings
+                    .members
+                    .entry(stem.to_ascii_lowercase())
+                    .or_default()
+                    .push(name.to_string());
+            }
+        }
+        siblings
+    }
+
+    pub fn from_dir(dir: &Path) -> Option<Self> {
+        let entries = fs::read_dir(dir).ok()?;
+        let names: Vec<String> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        Some(Self::from_names(names.iter().map(String::as_str)))
+    }
+
+    fn is_member(&self, name: &str) -> bool {
+        split_stem(name)
+            .and_then(|(stem, _)| self.members.get(&stem.to_ascii_lowercase()))
+            .is_some_and(|group| group.iter().any(|m| m.eq_ignore_ascii_case(name)))
+    }
+
+    fn find_xmp(&self, wanted: &str) -> Option<&String> {
+        let names = self.xmp_names.get(&wanted.to_ascii_lowercase())?;
+        let upper = format!("{}.XMP", &wanted[..wanted.len() - ".xmp".len()]);
+        names
+            .iter()
+            .find(|n| n.as_str() == wanted)
+            .or_else(|| names.iter().find(|n| **n == upper))
+            .or_else(|| names.iter().min())
+    }
+}
+
+pub struct SiblingCache {
+    dirs: Mutex<HashMap<PathBuf, Option<Arc<StemSiblings>>>>,
+}
+
+impl SiblingCache {
+    pub fn new() -> Self {
+        SiblingCache {
+            dirs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn get(&self, dir: &Path) -> Option<Arc<StemSiblings>> {
+        let mut dirs = self.dirs.lock().ok()?;
+        dirs.entry(dir.to_path_buf())
+            .or_insert_with(|| StemSiblings::from_dir(dir).map(Arc::new))
+            .clone()
+    }
 }
 
 fn log_stem_wins(image_path: &Path) {
@@ -414,18 +505,38 @@ fn log_stem_wins(image_path: &Path) {
     }
 }
 
-pub fn locate_sidecar(image_path: &Path) -> SidecarPaths {
-    let create_at = image_path.with_extension("xmp");
-    let stem_upper = image_path.with_extension("XMP");
-    let stem = [create_at.clone(), stem_upper.clone()]
-        .into_iter()
-        .find(|p| p.exists());
-    let full = ["xmp", "XMP"]
-        .into_iter()
-        .filter_map(|ext| full_name_sidecar(image_path, ext))
-        .filter(|p| *p != create_at && *p != stem_upper)
-        .find(|p| p.exists());
-    let existing = match (stem, full) {
+pub fn locate_sidecar(image_path: &Path, siblings: &StemSiblings) -> Option<SidecarPaths> {
+    let name = image_path.file_name()?.to_str()?;
+    let (stem, _) = split_stem(name)?;
+    let group = siblings.members.get(&stem.to_ascii_lowercase())?;
+    if !group.iter().any(|member| member == name) {
+        return None;
+    }
+
+    let raws: Vec<&String> = group.iter().filter(|m| is_sidecar_raw(m)).collect();
+    let is_owner = !siblings.is_member(stem)
+        && match raws.as_slice() {
+            [only] => only.as_str() == name,
+            [] => group.len() == 1,
+            _ => false,
+        };
+
+    let stem_name = format!("{}.xmp", stem);
+    let full_name = format!("{}.xmp", name);
+    let create_at = if is_owner && is_sidecar_raw(name) {
+        image_path.with_file_name(&stem_name)
+    } else {
+        image_path.with_file_name(&full_name)
+    };
+    let stem_found = is_owner
+        .then(|| siblings.find_xmp(&stem_name))
+        .flatten()
+        .map(|found| image_path.with_file_name(found));
+    let full_found = siblings
+        .find_xmp(&full_name)
+        .map(|found| image_path.with_file_name(found));
+
+    let existing = match (stem_found, full_found) {
         (Some(stem), Some(full)) => {
             if is_cloud_placeholder(&stem) {
                 Some(stem)
@@ -441,14 +552,10 @@ pub fn locate_sidecar(image_path: &Path) -> SidecarPaths {
         }
         (stem, full) => stem.or(full),
     };
-    SidecarPaths {
+    Some(SidecarPaths {
         existing,
         create_at,
-    }
-}
-
-pub fn resolve_xmp_path(image_path: &Path) -> Option<PathBuf> {
-    locate_sidecar(image_path).existing
+    })
 }
 
 fn skeleton_element(
@@ -535,27 +642,6 @@ fn check_skeleton(content: &str) -> Option<bool> {
 
 pub(crate) fn is_rapidraw_skeleton(content: &str) -> bool {
     check_skeleton(content).unwrap_or(false)
-}
-
-fn on_disk_path(path: &Path) -> PathBuf {
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return path.to_path_buf();
-    };
-    let Ok(entries) = fs::read_dir(parent) else {
-        return path.to_path_buf();
-    };
-    let wanted = name.to_string_lossy().to_lowercase();
-    let mut folded = None;
-    for entry in entries.flatten() {
-        let found = entry.file_name();
-        if found == name {
-            return path.to_path_buf();
-        }
-        if folded.is_none() && found.to_string_lossy().to_lowercase() == wanted {
-            folded = Some(found);
-        }
-    }
-    folded.map_or_else(|| path.to_path_buf(), |found| parent.join(found))
 }
 
 const RAPIDRAW_COLORS: [&str; 5] = ["red", "yellow", "green", "blue", "purple"];
@@ -2012,9 +2098,16 @@ fn sync_action(metadata: &ImageMetadata, side: &ReadSidecar, rr: &XmpSyncState) 
     }
 }
 
-pub(crate) fn sync_on_load(source_path: &Path, metadata: &mut ImageMetadata) -> bool {
+pub(crate) fn sync_on_load(
+    source_path: &Path,
+    metadata: &mut ImageMetadata,
+    siblings: &StemSiblings,
+) -> bool {
     let before = snapshot(metadata);
-    let Some(path) = locate_sidecar(source_path).existing else {
+    let Some(located) = locate_sidecar(source_path, siblings) else {
+        return false;
+    };
+    let Some(path) = located.existing else {
         metadata.xmp_conflict = false;
         return snapshot(metadata) != before;
     };
@@ -2062,8 +2155,11 @@ pub(crate) fn sync_on_save(
     source_path: &Path,
     metadata: &mut ImageMetadata,
     create_if_missing: bool,
+    siblings: &StemSiblings,
 ) -> bool {
-    let located = locate_sidecar(source_path);
+    let Some(located) = locate_sidecar(source_path, siblings) else {
+        return false;
+    };
     let Some(path) = located.existing else {
         if !create_if_missing {
             return false;
@@ -2077,9 +2173,19 @@ pub(crate) fn sync_on_save(
                 return false;
             }
         };
-        if let Err(e) = write_atomic(&target, out.as_bytes()) {
-            log::warn!("Not writing XMP for {}: {}", source_path.display(), e);
-            return false;
+        match create_atomic(&target, out.as_bytes()) {
+            Ok(true) => {}
+            Ok(false) => {
+                log::debug!(
+                    "XMP sidecar appeared for {}, leaving it alone",
+                    source_path.display()
+                );
+                return false;
+            }
+            Err(e) => {
+                log::warn!("Not writing XMP for {}: {}", source_path.display(), e);
+                return false;
+            }
         }
         set_base(metadata, &sidecar_file_name(&target), &rr);
         metadata.xmp_conflict = false;
@@ -2121,8 +2227,9 @@ pub(crate) fn sync_on_save(
         SyncAction::Write => {
             let written = match update_xmp(&side.content, &rr.to_values()) {
                 Ok(None) => Ok(()),
-                Ok(Some(out)) => write_atomic(&on_disk_path(&side.path), out.as_bytes())
-                    .map_err(|e| e.to_string()),
+                Ok(Some(out)) => {
+                    write_atomic(&side.path, out.as_bytes()).map_err(|e| e.to_string())
+                }
                 Err(e) => Err(e.to_string()),
             };
             match written {
@@ -2142,8 +2249,10 @@ pub(crate) fn resolve_xmp_conflict(
     source_path: &Path,
     metadata: &mut ImageMetadata,
     choice: ConflictChoice,
+    siblings: &StemSiblings,
 ) -> Result<(), String> {
-    let path = resolve_xmp_path(source_path)
+    let path = locate_sidecar(source_path, siblings)
+        .and_then(|located| located.existing)
         .ok_or_else(|| format!("no XMP sidecar for {}", source_path.display()))?;
     let side = read_sidecar(path, metadata)?;
     match choice {
@@ -2156,7 +2265,7 @@ pub(crate) fn resolve_xmp_conflict(
             if let Some(out) = update_xmp(&side.content, &rr.to_values())
                 .map_err(|e| format!("cannot write {}: {}", side.path.display(), e))?
             {
-                write_atomic(&on_disk_path(&side.path), out.as_bytes())
+                write_atomic(&side.path, out.as_bytes())
                     .map_err(|e| format!("cannot write {}: {}", side.path.display(), e))?;
             }
             set_base(metadata, &side.file, &rr);
@@ -2169,11 +2278,13 @@ pub(crate) fn resolve_xmp_conflict(
 pub(crate) fn xmp_conflict_info(
     source_path: &Path,
     metadata: &ImageMetadata,
+    siblings: &StemSiblings,
 ) -> Result<Option<XmpConflictInfo>, String> {
     if !metadata.xmp_conflict {
         return Ok(None);
     }
-    let Some(path) = resolve_xmp_path(source_path) else {
+    let Some(path) = locate_sidecar(source_path, siblings).and_then(|located| located.existing)
+    else {
         return Ok(None);
     };
     let mut metadata = metadata.clone();
