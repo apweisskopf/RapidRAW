@@ -453,7 +453,7 @@ fn modify_tags_for_path(
         && settings.enable_xmp_sync.unwrap_or(false)
     {
         let create_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
-        file_management::sync_metadata_to_xmp(
+        crate::xmp_sidecar::sync_metadata_to_xmp(
             &sidecar_path,
             &source_path,
             &metadata,
@@ -517,7 +517,7 @@ fn sync_xmp_for_rrdata(
         return;
     }
     if let Some(source_path) = rrdata_source_path(rrdata_path) {
-        file_management::sync_metadata_to_xmp(
+        crate::xmp_sidecar::sync_metadata_to_xmp(
             rrdata_path,
             &source_path,
             metadata,

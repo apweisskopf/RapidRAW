@@ -10,6 +10,7 @@ use crate::file_management;
 use crate::formats::is_raw_file;
 use crate::image_processing::{ImageFlag, ImageMetadata};
 use crate::tagging::{COLOR_TAG_PREFIX, USER_TAG_PREFIX};
+use crate::xmp_sidecar;
 use chrono::{DateTime, Local, LocalResult, NaiveDateTime, TimeZone, Utc};
 use exif::{Exif, In, Value};
 use image::ImageDecoder;
@@ -1695,8 +1696,8 @@ impl ExportXmp {
         Self {
             keywords,
             rating: (metadata.rating > 0 || metadata.flag == Some(ImageFlag::Reject))
-                .then(|| file_management::xmp_rating(metadata)),
-            label: file_management::xmp_label(tags),
+                .then(|| xmp_sidecar::xmp_rating(metadata)),
+            label: xmp_sidecar::xmp_label(tags),
         }
     }
 }
@@ -1745,7 +1746,7 @@ fn read_source_xmp(path: &Path) -> Option<String> {
 fn build_export_xmp(xmp: &ExportXmp, source_xmp: Option<&str>) -> Option<String> {
     let mut keywords = xmp.keywords.clone();
     for tag in source_xmp
-        .map(file_management::extract_xmp_tags)
+        .map(xmp_sidecar::extract_xmp_tags)
         .unwrap_or_default()
     {
         push_keyword(
@@ -1787,10 +1788,7 @@ fn export_xmp_description(xmp: &ExportXmp, keywords: &[String]) -> String {
     }
     if !keywords.is_empty() {
         let escaped: Vec<Cow<str>> = keywords.iter().map(|k| escape(k.as_str())).collect();
-        properties.push_str(&format!(
-            "   {}\n",
-            file_management::xmp_subject_bag(&escaped)
-        ));
+        properties.push_str(&format!("   {}\n", xmp_sidecar::xmp_subject_bag(&escaped)));
     }
     if properties.is_empty() {
         return properties;

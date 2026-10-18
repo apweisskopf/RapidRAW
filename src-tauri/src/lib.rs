@@ -64,6 +64,7 @@ mod tagging;
 mod tagging_utils;
 mod white_balance;
 mod window_customizer;
+mod xmp_sidecar;
 
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fs;
