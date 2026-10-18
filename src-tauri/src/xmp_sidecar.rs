@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use quick_xml::XmlVersion;
 use quick_xml::escape::{escape, unescape};
@@ -10,7 +11,7 @@ use quick_xml::name::{NamespaceResolver, PrefixDeclaration, ResolveResult};
 use quick_xml::reader::NsReader;
 use serde::{Deserialize, Serialize};
 
-use crate::file_management::write_atomic;
+use crate::file_management::{is_cloud_placeholder, write_atomic};
 use crate::image_processing::{ImageFlag, ImageMetadata, default_adjustments};
 use crate::tagging::{COLOR_TAG_PREFIX, USER_TAG_PREFIX};
 
@@ -20,6 +21,7 @@ const NS_DC: &[u8] = b"http://purl.org/dc/elements/1.1/";
 const NS_X: &[u8] = b"adobe:ns:meta/";
 const NS_DARKTABLE: &[u8] = b"http://darktable.sf.net/";
 const NS_DIGIKAM: &[u8] = b"http://www.digikam.org/ns/1.0/";
+const NS_LR: &[u8] = b"http://ns.adobe.com/lightroom/1.0/";
 
 pub(crate) fn is_darktable_internal(tag: &str) -> bool {
     tag.starts_with("darktable|")
@@ -387,16 +389,173 @@ pub fn xmp_subject_bag<S: AsRef<str>>(items: &[S]) -> String {
     bag
 }
 
-pub fn resolve_xmp_path(image_path: &Path) -> Option<PathBuf> {
-    let xmp_path = image_path.with_extension("xmp");
-    let xmp_path_upper = image_path.with_extension("XMP");
-    if xmp_path.exists() {
-        Some(xmp_path)
-    } else if xmp_path_upper.exists() {
-        Some(xmp_path_upper)
-    } else {
-        None
+pub struct SidecarPaths {
+    pub existing: Option<PathBuf>,
+    pub create_at: PathBuf,
+}
+
+fn full_name_sidecar(image_path: &Path, extension: &str) -> Option<PathBuf> {
+    let mut name = image_path.file_name()?.to_os_string();
+    name.push(".");
+    name.push(extension);
+    Some(image_path.with_file_name(name))
+}
+
+fn log_stem_wins(image_path: &Path) {
+    static SEEN: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut seen) = seen.lock()
+        && seen.insert(image_path.to_path_buf())
+    {
+        log::info!(
+            "Both naming schemes exist for {}, using the file without the image extension",
+            image_path.display()
+        );
     }
+}
+
+pub fn locate_sidecar(image_path: &Path) -> SidecarPaths {
+    let create_at = image_path.with_extension("xmp");
+    let stem_upper = image_path.with_extension("XMP");
+    let stem = [create_at.clone(), stem_upper.clone()]
+        .into_iter()
+        .find(|p| p.exists());
+    let full = ["xmp", "XMP"]
+        .into_iter()
+        .filter_map(|ext| full_name_sidecar(image_path, ext))
+        .filter(|p| *p != create_at && *p != stem_upper)
+        .find(|p| p.exists());
+    let existing = match (stem, full) {
+        (Some(stem), Some(full)) => {
+            if is_cloud_placeholder(&stem) {
+                Some(stem)
+            } else {
+                match fs::read_to_string(&stem) {
+                    Ok(content) if is_rapidraw_skeleton(&content) => Some(full),
+                    _ => {
+                        log_stem_wins(image_path);
+                        Some(stem)
+                    }
+                }
+            }
+        }
+        (stem, full) => stem.or(full),
+    };
+    SidecarPaths {
+        existing,
+        create_at,
+    }
+}
+
+pub fn resolve_xmp_path(image_path: &Path) -> Option<PathBuf> {
+    locate_sidecar(image_path).existing
+}
+
+fn skeleton_element(
+    depth: usize,
+    descs: &mut usize,
+    resolver: &NamespaceResolver,
+    ns: &Ns,
+    e: &BytesStart,
+) -> Option<()> {
+    let local_name = e.local_name();
+    let local = local_name.as_ref();
+    match depth {
+        0 => {
+            if !is_name(ns, NS_X, local, &[b"xmpmeta"]) {
+                return None;
+            }
+            let mut toolkit = false;
+            for attr in e.attributes() {
+                let attr = attr.ok()?;
+                let (res, local_attr) = resolver.resolve_attribute(attr.key);
+                let attr_ns = bound(res).ok()?;
+                if is_name(&attr_ns, NS_X, local_attr.as_ref(), &[b"xmptk"]) {
+                    toolkit = attr.value.as_ref() == b"RapidRAW";
+                }
+            }
+            toolkit.then_some(())
+        }
+        1 => is_name(ns, NS_RDF, local, &[b"RDF"]).then_some(()),
+        2 => {
+            if !is_name(ns, NS_RDF, local, &[b"Description"]) {
+                return None;
+            }
+            *descs += 1;
+            if *descs > 1 {
+                return None;
+            }
+            for attr in e.attributes() {
+                let attr = attr.ok()?;
+                let key = attr.key.as_ref();
+                if key == b"xmlns" || key.starts_with(b"xmlns:") {
+                    continue;
+                }
+                let (res, local_attr) = resolver.resolve_attribute(attr.key);
+                let attr_ns = bound(res).ok()?;
+                let local_attr = local_attr.as_ref();
+                let allowed = is_name(&attr_ns, NS_RDF, local_attr, &[b"about"])
+                    || is_name(&attr_ns, NS_XMP, local_attr, &[b"Rating", b"Label"]);
+                if !allowed {
+                    return None;
+                }
+            }
+            Some(())
+        }
+        3 => {
+            let allowed = is_name(ns, NS_XMP, local, &[b"Rating", b"Label"])
+                || is_name(ns, NS_DC, local, &[b"subject"])
+                || is_name(ns, NS_LR, local, &[b"hierarchicalSubject"]);
+            allowed.then_some(())
+        }
+        _ => Some(()),
+    }
+}
+
+fn check_skeleton(content: &str) -> Option<bool> {
+    let mut reader = NsReader::from_str(content);
+    let mut depth = 0usize;
+    let mut descs = 0usize;
+    loop {
+        let (res, event) = reader.read_resolved_event().ok()?;
+        let ns = bound(res).ok()?;
+        match event {
+            Event::Start(e) => {
+                skeleton_element(depth, &mut descs, reader.resolver(), &ns, &e)?;
+                depth += 1;
+            }
+            Event::Empty(e) => skeleton_element(depth, &mut descs, reader.resolver(), &ns, &e)?,
+            Event::End(_) => depth = depth.checked_sub(1)?,
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Some(descs == 1)
+}
+
+pub(crate) fn is_rapidraw_skeleton(content: &str) -> bool {
+    check_skeleton(content).unwrap_or(false)
+}
+
+fn on_disk_path(path: &Path) -> PathBuf {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return path.to_path_buf();
+    };
+    let wanted = name.to_string_lossy().to_lowercase();
+    let mut folded = None;
+    for entry in entries.flatten() {
+        let found = entry.file_name();
+        if found == name {
+            return path.to_path_buf();
+        }
+        if folded.is_none() && found.to_string_lossy().to_lowercase() == wanted {
+            folded = Some(found);
+        }
+    }
+    folded.map_or_else(|| path.to_path_buf(), |found| parent.join(found))
 }
 
 const RAPIDRAW_COLORS: [&str; 5] = ["red", "yellow", "green", "blue", "purple"];
@@ -1611,9 +1770,20 @@ pub(crate) fn classify(
     base: Option<&XmpSyncState>,
     rr: &XmpSyncState,
     xmp: &XmpSyncState,
+    rr_wins_rating_tie: bool,
 ) -> SyncAction {
     if rr == xmp {
         return SyncAction::InSync;
+    }
+    let mut adjusted;
+    let mut xmp = xmp;
+    if base.is_none() && rr_wins_rating_tie && rr.rating != 0 {
+        adjusted = xmp.clone();
+        adjusted.rating = rr.rating;
+        if *rr == adjusted {
+            return SyncAction::Write;
+        }
+        xmp = &adjusted;
     }
     match base {
         Some(base) if rr == base => SyncAction::Import,
@@ -1806,6 +1976,7 @@ struct ReadSidecar {
     content: String,
     base: Option<XmpSyncState>,
     xmp: XmpSyncState,
+    rating_tie: bool,
 }
 
 impl ReadSidecar {
@@ -1813,12 +1984,14 @@ impl ReadSidecar {
         let file = sidecar_file_name(&path);
         let base = matching_base(metadata, &file);
         let xmp = xmp_state(fields, &base.clone().unwrap_or_default());
+        let rating_tie = base.is_none() && fields.darktable_ns;
         ReadSidecar {
             path,
             file,
             content,
             base,
             xmp,
+            rating_tie,
         }
     }
 }
@@ -1832,13 +2005,8 @@ fn read_sidecar(path: PathBuf, metadata: &mut ImageMetadata) -> Result<ReadSidec
     Ok(ReadSidecar::new(path, content, &fields, metadata))
 }
 
-fn sync_action(
-    metadata: &ImageMetadata,
-    base: Option<&XmpSyncState>,
-    rr: &XmpSyncState,
-    xmp: &XmpSyncState,
-) -> SyncAction {
-    match classify(base, rr, xmp) {
+fn sync_action(metadata: &ImageMetadata, side: &ReadSidecar, rr: &XmpSyncState) -> SyncAction {
+    match classify(side.base.as_ref(), rr, &side.xmp, side.rating_tie) {
         SyncAction::Import | SyncAction::Write if metadata.xmp_conflict => SyncAction::Conflict,
         action => action,
     }
@@ -1846,7 +2014,7 @@ fn sync_action(
 
 pub(crate) fn sync_on_load(source_path: &Path, metadata: &mut ImageMetadata) -> bool {
     let before = snapshot(metadata);
-    let Some(path) = resolve_xmp_path(source_path) else {
+    let Some(path) = locate_sidecar(source_path).existing else {
         metadata.xmp_conflict = false;
         return snapshot(metadata) != before;
     };
@@ -1863,7 +2031,7 @@ pub(crate) fn sync_on_load(source_path: &Path, metadata: &mut ImageMetadata) -> 
 
     let rr = rr_state(metadata);
     let first_sync = side.base.is_none();
-    match sync_action(metadata, side.base.as_ref(), &rr, &side.xmp) {
+    match sync_action(metadata, &side, &rr) {
         SyncAction::InSync => {
             if first_sync {
                 import_state(metadata, &side.xmp, true);
@@ -1895,12 +2063,13 @@ pub(crate) fn sync_on_save(
     metadata: &mut ImageMetadata,
     create_if_missing: bool,
 ) -> bool {
-    let Some(path) = resolve_xmp_path(source_path) else {
+    let located = locate_sidecar(source_path);
+    let Some(path) = located.existing else {
         if !create_if_missing {
             return false;
         }
         let rr = rr_state(metadata);
-        let target = source_path.with_extension("xmp");
+        let target = located.create_at;
         let out = match update_xmp(NEW_XMP, &rr.to_values()) {
             Ok(out) => out.unwrap_or_else(|| NEW_XMP.to_string()),
             Err(e) => {
@@ -1928,7 +2097,7 @@ pub(crate) fn sync_on_save(
 
     let rr = rr_state(metadata);
     let first_sync = side.base.is_none();
-    let imported = match sync_action(metadata, side.base.as_ref(), &rr, &side.xmp) {
+    let imported = match sync_action(metadata, &side, &rr) {
         SyncAction::Conflict => {
             if !metadata.xmp_conflict {
                 log::info!("XMP conflict for {}", source_path.display());
@@ -1952,9 +2121,8 @@ pub(crate) fn sync_on_save(
         SyncAction::Write => {
             let written = match update_xmp(&side.content, &rr.to_values()) {
                 Ok(None) => Ok(()),
-                Ok(Some(out)) => {
-                    write_atomic(&side.path, out.as_bytes()).map_err(|e| e.to_string())
-                }
+                Ok(Some(out)) => write_atomic(&on_disk_path(&side.path), out.as_bytes())
+                    .map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
             };
             match written {
@@ -1988,7 +2156,7 @@ pub(crate) fn resolve_xmp_conflict(
             if let Some(out) = update_xmp(&side.content, &rr.to_values())
                 .map_err(|e| format!("cannot write {}: {}", side.path.display(), e))?
             {
-                write_atomic(&side.path, out.as_bytes())
+                write_atomic(&on_disk_path(&side.path), out.as_bytes())
                     .map_err(|e| format!("cannot write {}: {}", side.path.display(), e))?;
             }
             set_base(metadata, &side.file, &rr);
