@@ -363,7 +363,7 @@ fn compute_patched_and_warped(
 #[tauri::command]
 fn get_image_dimensions(path: String) -> Result<ImageDimensions, String> {
     let (source_path, _) = parse_virtual_path(&path);
-    image::image_dimensions(&source_path)
+    crate::image_loader::image_dimensions(&source_path)
         .map(|(width, height)| ImageDimensions { width, height })
         .map_err(|e| e.to_string())
 }

@@ -75,6 +75,7 @@ sysinfo = "0.39.6"
 # alongside tauri 2.11.5; Cargo.lock keeps desktop on 2.8.0/2.5.0.
 tauri-plugin-http = "2.7"
 tauri-plugin-store = "2.4"
+moxcms = "0.8"
 # Native OS HEVC decoders only. backend-rust stays off for patent reasons.
 heic = { git = "https://github.com/imazen/heic.git", rev = "dbf35c02b349f108e06f99a7f459b7e6a5299173", default-features = false, features = [
     "backend-videotoolbox",
@@ -131,6 +132,10 @@ tauri-build = { version = "2.6", features = [] }
 sha2 = "0.11"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 hex = "0.4"
+
+# Fixes the heic VideoToolbox backend's range and 10-bit handling; see vendor/heic-backend-videotoolbox/VENDORED.md.
+[patch."https://github.com/imazen/heic.git"]
+heic-backend-videotoolbox = { path = "vendor/heic-backend-videotoolbox" }
 
 [profile.dev]
 opt-level = 2

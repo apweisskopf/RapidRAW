@@ -373,6 +373,15 @@ fn linearize_embedded_preview(preview: DynamicImage) -> DynamicImage {
     DynamicImage::ImageRgb32F(linear_preview)
 }
 
+pub fn image_dimensions(path: &Path) -> Result<(u32, u32)> {
+    if is_heic_file(path) {
+        let bytes = read_file_mapped(path).map_err(|e| anyhow!("{}", e))?;
+        return crate::heic_processing::heic_dimensions(&bytes)
+            .ok_or_else(|| anyhow!("Failed to read HEIC dimensions"));
+    }
+    image::image_dimensions(path).context("Failed to read image dimensions")
+}
+
 pub fn load_image_with_orientation(
     bytes: &[u8],
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
