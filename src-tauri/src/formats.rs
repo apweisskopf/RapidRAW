@@ -79,7 +79,8 @@ pub const NON_RAW_EXTENSIONS: &[&str] = &[
     "heic", "heif",
 ];
 
-const HEIC_EXTENSIONS: &[&str] = &["heic", "heif"];
+// HEVC-coded HEIF brands. AVIF shares the container but not these brands.
+const HEIC_BRANDS: &[&[u8; 4]] = &[b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx"];
 
 pub fn is_raw_file<P: AsRef<Path>>(path: P) -> bool {
     let ext = match path.as_ref().extension().and_then(|s| s.to_str()) {
@@ -92,15 +93,25 @@ pub fn is_raw_file<P: AsRef<Path>>(path: P) -> bool {
         .any(|(raw_ext, _)| raw_ext.eq_ignore_ascii_case(ext))
 }
 
-pub fn is_heic_file<P: AsRef<Path>>(path: P) -> bool {
-    let ext = match path.as_ref().extension().and_then(|s| s.to_str()) {
-        Some(e) => e,
-        None => return false,
+/// Detects HEIC by its `ftyp` brands rather than the file name, since some
+/// apps save HEIC files as `.jpg`.
+pub fn is_heic_data(bytes: &[u8]) -> bool {
+    if bytes.get(4..8) != Some(b"ftyp") {
+        return false;
+    }
+    let box_size = bytes
+        .get(0..4)
+        .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let Some(brands) = bytes.get(8..box_size.min(bytes.len())) else {
+        return false;
     };
-
-    HEIC_EXTENSIONS
+    // Major brand, minor version, then compatible brands.
+    brands
+        .as_chunks::<4>()
+        .0
         .iter()
-        .any(|heic_ext| heic_ext.eq_ignore_ascii_case(ext))
+        .enumerate()
+        .any(|(i, brand)| i != 1 && HEIC_BRANDS.iter().any(|b| b.as_slice() == brand))
 }
 
 pub fn is_supported_image_file<P: AsRef<Path>>(path: P) -> bool {
