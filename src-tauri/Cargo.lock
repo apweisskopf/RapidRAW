@@ -37,6 +37,7 @@ dependencies = [
  "log",
  "memmap2",
  "mimalloc",
+ "moxcms",
  "mozjpeg-rs",
  "nalgebra",
  "ndarray",
@@ -2650,7 +2651,6 @@ dependencies = [
 [[package]]
 name = "heic-backend-videotoolbox"
 version = "0.2.0"
-source = "git+https://github.com/imazen/heic.git?rev=dbf35c02b349f108e06f99a7f459b7e6a5299173#dbf35c02b349f108e06f99a7f459b7e6a5299173"
 dependencies = [
  "enough",
  "heic-core",

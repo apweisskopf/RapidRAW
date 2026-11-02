@@ -1,0 +1,58 @@
+[package]
+name = "heic-backend-videotoolbox"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+license = "AGPL-3.0-only OR LicenseRef-Imazen-Commercial"
+repository = "https://github.com/imazen/heic"
+description = "Apple VideoToolbox HEVC decoder backend for the heic crate (macOS, iOS, tvOS, visionOS)"
+keywords = ["heic", "heif", "hevc", "videotoolbox", "apple"]
+categories = ["multimedia::images", "os::macos-apis"]
+
+[features]
+default = []
+
+[dependencies]
+heic-core = { git = "https://github.com/imazen/heic.git", rev = "dbf35c02b349f108e06f99a7f459b7e6a5299173", features = ["std"] }
+enough = "0.4.3"
+
+# Apple framework bindings. Gated on apple target_os so non-Apple builds
+# don't pull in objc2 or its transitive deps. Versions per the
+# platform-validation pass (objc2 0.6.x ecosystem, "Retained<T>" rename).
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "visionos"))'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-foundation = { version = "0.3", features = [
+    "CFBase",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+] }
+objc2-core-media = { version = "0.3", features = [
+    "CMBase",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+    "CMSampleBuffer",
+    "CMTime",
+] }
+objc2-core-video = { version = "0.3", features = [
+    "CVBase",
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVPixelFormatDescription",
+] }
+objc2-video-toolbox = { version = "0.3", features = [
+    "VTBase",
+    "VTDecompressionProperties",
+    "VTDecompressionSession",
+    "VTErrors",
+    "VTSession",
+] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
